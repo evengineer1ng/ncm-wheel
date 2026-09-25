@@ -36,33 +36,12 @@ jobs:
       - name: Install vgamepad without running its driver installer
         shell: pwsh
         run: |
-          # `pip install vgamepad` runs the ViGEmBus setup program during installation. On a desktop that is
-          # a UAC prompt; on a headless runner it is a process waiting for input that never comes, which is
-          # exactly how three builds hung with no output. A try/catch cannot help -- nothing ever returns.
-          #
-          # So: fetch the distribution and install it WITHOUT executing its setup code. A wheel cannot run
-          # code at install time, which is the whole reason to prefer one. The driver is a requirement on the
-          # player's machine, never on the builder's.
-          New-Item -ItemType Directory -Force -Path dist-deps | Out-Null
-          python -m pip download vgamepad --no-deps --dest dist-deps
-          $whl = Get-ChildItem dist-deps -Filter *.whl | Select-Object -First 1
-          if ($whl) {
-            Write-Host "installing wheel $($whl.Name) with --no-deps (no setup code runs)"
-            python -m pip install --no-deps $whl.FullName
-          } else {
-            # No wheel published: unpack the sdist and drop the package into site-packages by hand, still
-            # without running setup.py.
-            $sdist = Get-ChildItem dist-deps -Recurse -Include *.tar.gz,*.zip | Select-Object -First 1
-            if (-not $sdist) { throw "pip download produced neither a wheel nor an sdist" }
-            Write-Host "no wheel published; unpacking $($sdist.Name)"
-            tar -xf $sdist.FullName -C dist-deps
-            $pkg = Get-ChildItem dist-deps -Directory -Recurse -Filter vgamepad | Select-Object -First 1
-            if (-not $pkg) { throw "vgamepad package directory not found in the sdist" }
-            $site = python -c "import site; print(site.getsitepackages()[-1])"
-            Copy-Item -Recurse -Force $pkg.FullName (Join-Path $site 'vgamepad')
-          }
+          # vgamepad publishes an sdist and NO wheel, and its setup.py launches the ViGEmBus driver
+          # installer. Both `pip install` and `pip download` execute that setup code -- download does it to
+          # build metadata -- and on a headless runner it waits forever for input that never comes. Three
+          # builds hung for hours before this was understood, which is why pip is kept away from it entirely.
+          python tools-install-vgamepad.py
           python -c "import vgamepad, os; print('vgamepad at', os.path.dirname(vgamepad.__file__))"
-          if ($LASTEXITCODE -ne 0) { throw "vgamepad is not importable; the virtual controller cannot be built" }
 
       - name: Build
         shell: pwsh
