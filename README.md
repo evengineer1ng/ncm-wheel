@@ -31,10 +31,17 @@ enumerates your hardware through it, decides when the rig is live, tunes the fee
 
 ## Install
 
-1. Download `NCM Wheel Support.exe` from [Releases](../../releases).
-2. Run it. There is no window — that is expected.
-3. Join an NCM server, open the NCM panel (`F6`) and pick **WHEEL/PEDALS**.
-4. Press **ARM FORCE OUTPUT**, then start at the **lowest strength** and work up.
+**You need [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) first.** It is the virtual controller
+driver that lets your wheel and pedals actually drive the car — Cyberpunk has no native wheel support, so
+the rig has to be presented to it as a controller. Install it once and forget it.
+
+(Force feedback alone does not need ViGEmBus. If it is missing you will still get FFB, and no steering.)
+
+1. Install ViGEmBus.
+2. Download `NCM Wheel Support.exe` from [Releases](../../releases), and check it against `SHA256SUMS.txt`.
+3. Run it. There is no window — that is expected.
+4. Join an NCM server, open the NCM panel (`F6`) and pick **WHEEL/PEDALS**.
+5. Press **ARM FORCE OUTPUT**, then start at the **lowest strength** and work up.
 
 To have it start with Windows, run `build.ps1 -InstallStartup`, or drop a shortcut to the exe in your
 Startup folder yourself. It is an ordinary shortcut, not a service or a registry entry, so you can delete it.
@@ -137,9 +144,15 @@ receives the Lua bridge. Telemetry goes up that socket at 30 Hz; settings come b
 ## Requirements
 
 - Windows
-- [ViGEmBus](https://github.com/nefarius/ViGEmBus) for the virtual controller
+- **[ViGEmBus](https://github.com/nefarius/ViGEmBus/releases)** — required for wheel and pedal input
 - Logitech G HUB, for Logitech wheels
 - Python 3.10+ only if running from source
+
+## Builds
+
+Releases are built by GitHub Actions from the tagged source, and every release carries `SHA256SUMS.txt`.
+The binary is **not code signed**, so Windows SmartScreen will warn on first run. If you would rather not
+trust a binary at all, [build it yourself](#running-from-source-instead) — it is one command.
 
 ## License
 

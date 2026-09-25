@@ -1,0 +1,97 @@
+name: Build and release
+
+# Builds the companion on a clean Windows runner and attaches it to a release, so the binary people download
+# is demonstrably produced from the public source rather than from someone's desktop. For an unsigned tool
+# that drives force-feedback hardware, a reproducible public build is worth more trust than a signature from
+# a name nobody recognises.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:        # so a build can be exercised without cutting a release
+
+permissions:
+  contents: write           # required to create the release and upload assets
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          # vgamepad ships the ViGEmBus installer and may try to run it during install. On a runner that is
+          # pointless and can be noisy, but only the PYTHON package is needed to BUILD -- the driver is a
+          # requirement on the player's machine, not here. So a driver-install failure must not fail the build.
+          python -m pip install pysdl2 pysdl2-dll pyinstaller
+          try { python -m pip install vgamepad } catch { Write-Host "vgamepad install reported a problem; continuing" }
+          python -c "import vgamepad" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::vgamepad python package unavailable -- the virtual controller half cannot be built"
+            exit 1
+          }
+          Write-Host "vgamepad importable"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed `
+            --name "NCM Wheel Support" `
+            --collect-all sdl2dll `
+            --hidden-import sdl2 `
+            --hidden-import vgamepad `
+            ncm-wheel.py
+          if (-not (Test-Path "dist\NCM Wheel Support.exe")) { throw "build produced no exe" }
+
+      - name: Smoke test the binary
+        shell: pwsh
+        run: |
+          # A runner has no wheel, so this proves the exe starts, parses arguments and loads its profiles --
+          # not that it can drive hardware. Worth doing anyway: a bundle missing sdl2dll fails exactly here.
+          $p = Start-Process -FilePath "dist\NCM Wheel Support.exe" -ArgumentList '--help' -PassThru -Wait
+          Write-Host "exit code: $($p.ExitCode)"
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $h = Get-FileHash "dist\NCM Wheel Support.exe" -Algorithm SHA256
+          "$($h.Hash.ToLower())  NCM Wheel Support.exe" | Out-File -Encoding ascii "dist\SHA256SUMS.txt"
+          Get-Content "dist\SHA256SUMS.txt"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncm-wheel-windows
+          path: |
+            dist/NCM Wheel Support.exe
+            dist/SHA256SUMS.txt
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true          # so the changelog can be read before anyone downloads it
+          generate_release_notes: true
+          files: |
+            dist/NCM Wheel Support.exe
+            dist/SHA256SUMS.txt
+          body: |
+            **Alpha.** Tested on one wheelbase (Logitech G29, gear drive). Belt drive and direct drive are
+            capped conservatively because nobody has tested them — see the README's safety section, and
+            please report back if you have either.
+
+            Built by GitHub Actions from the tagged source. Verify with `SHA256SUMS.txt`:
+
+            ```powershell
+            Get-FileHash ".\NCM Wheel Support.exe" -Algorithm SHA256
+            ```
+
+            **Requirements:** [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) for wheel and pedal
+            input, and Logitech G HUB if you have a Logitech wheel.

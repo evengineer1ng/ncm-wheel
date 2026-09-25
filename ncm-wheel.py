@@ -408,7 +408,14 @@ class Input:
             import sdl2
             import vgamepad as vg
         except Exception as exc:                                # noqa: BLE001 - diagnostic path
-            return "input unavailable: %s (is ViGEmBus installed?)" % exc
+            # Name the cause and the fix. "input unavailable" on its own sends someone hunting through a
+            # stack trace for a driver they have never heard of.
+            detail = str(exc)
+            if "vgamepad" in detail or "ViGEm" in detail or "client" in detail.lower():
+                return ("ViGEmBus not found -- wheel and pedals will not drive the car without it. "
+                        "Install it from https://github.com/nefarius/ViGEmBus/releases and restart. "
+                        "(Force feedback does not need it and will still work.)")
+            return "input unavailable: %s" % detail
         self.sdl, self.vg = sdl2, vg
         try:
             sdl2.SDL_Init(sdl2.SDL_INIT_JOYSTICK | sdl2.SDL_INIT_GAMECONTROLLER)
@@ -1303,6 +1310,7 @@ def main() -> int:
         why_in = rig.open()
         if why_in:
             print("[in ] INPUT UNAVAILABLE: %s" % why_in, flush=True)
+            print("[in ] Force feedback is unaffected; steering and pedals are not available.", flush=True)
             rig = None
         else:
             rig.start()
