@@ -57,7 +57,7 @@ jobs:
         shell: pwsh
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed `
-            --name "NCM Wheel Support" `
+            --name "NCM-Wheel-Support" `
             --collect-all sdl2dll `
             --add-data "wheel-profiles;wheel-profiles" `
             --add-data "$env:VGAMEPAD_PKG;vgamepad" `
@@ -65,7 +65,7 @@ jobs:
             --hidden-import vgamepad `
             --hidden-import tkinter `
             ncm-wheel.py
-          if (-not (Test-Path "dist\NCM Wheel Support.exe")) { throw "build produced no exe" }
+          if (-not (Test-Path "dist\NCM-Wheel-Support.exe")) { throw "build produced no exe" }
           Get-ChildItem dist
 
       - name: Smoke test the binary
@@ -74,7 +74,7 @@ jobs:
           # A runner has no wheel, so this proves the exe starts, unpacks and finds its own bundled data --
           # precisely what 0.1.0 got wrong twice, silently, in ways a source build never showed.
           $log = Join-Path $env:TEMP 'smoke.log'
-          $p = Start-Process -FilePath "dist\NCM Wheel Support.exe" -PassThru `
+          $p = Start-Process -FilePath "dist\NCM-Wheel-Support.exe" -PassThru `
                -ArgumentList '--headless','--no-input','--port','38499','--log',$log
           Start-Sleep -Seconds 25
           if (-not $p.HasExited) { $p.Kill() }
@@ -87,8 +87,8 @@ jobs:
       - name: Checksums
         shell: pwsh
         run: |
-          $h = Get-FileHash "dist\NCM Wheel Support.exe" -Algorithm SHA256
-          "$($h.Hash.ToLower())  NCM Wheel Support.exe" | Out-File -Encoding ascii "dist\SHA256SUMS.txt"
+          $h = Get-FileHash "dist\NCM-Wheel-Support.exe" -Algorithm SHA256
+          "$($h.Hash.ToLower())  NCM-Wheel-Support.exe" | Out-File -Encoding ascii "dist\SHA256SUMS.txt"
           Get-Content "dist\SHA256SUMS.txt"
 
       - name: Upload build artifacts
@@ -96,7 +96,7 @@ jobs:
         with:
           name: ncm-wheel-windows
           path: |
-            dist/NCM Wheel Support.exe
+            dist/NCM-Wheel-Support.exe
             dist/SHA256SUMS.txt
 
       - name: Release
@@ -107,7 +107,7 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true      # a release with no binary is worse than no release
           files: |
-            dist/NCM Wheel Support.exe
+            dist/NCM-Wheel-Support.exe
             dist/SHA256SUMS.txt
           body: |
             Wheel, pedals and force feedback for Cyberpunk 2077 multiplayer on OPEN//77, driven by real
@@ -130,7 +130,7 @@ jobs:
             Built by GitHub Actions from the tagged source. Verify with `SHA256SUMS.txt`:
 
             ```powershell
-            Get-FileHash ".\NCM Wheel Support.exe" -Algorithm SHA256
+            Get-FileHash ".\NCM-Wheel-Support.exe" -Algorithm SHA256
             ```
 
             **Requirements:** Windows 10/11. [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) for

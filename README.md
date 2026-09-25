@@ -36,7 +36,7 @@ the game, where you are already sitting.
 
 ## Install
 
-1. Download `NCM Wheel Support.exe` from [Releases](../../releases), and check it against `SHA256SUMS.txt`.
+1. Download `NCM-Wheel-Support.exe` from [Releases](../../releases), and check it against `SHA256SUMS.txt`.
 2. Run it. A small status window opens: it lists the hardware it found, says whether the game has
    connected, and shows anything that went wrong. Minimise it and leave it running.
 3. **If ViGEmBus is missing it will offer to install it for you.** That is the driver that lets your wheel
@@ -201,6 +201,20 @@ trust a binary at all, [build it yourself](#running-from-source-instead) — it 
 MIT. See [LICENSE](LICENSE).
 
 ## Changelog
+
+### 0.2.1
+
+- **All-in-one wheels work.** Where the rim, wheelbase and pedals are one device — a Thrustmaster, for
+  instance — the buttons were never read at all: the button role was only offered to a device that had taken
+  no other role. A wheel that steers and brakes and cannot press A is exactly the failure this project set
+  out to avoid.
+- **Roles are chosen by looking at every device together**, rather than by whichever was enumerated first. A
+  25-button wheelbase was claiming the button role before a dedicated button box further down the list was
+  even considered.
+- **Buttons can be bound by pressing them** — *Devices... → Map buttons...* Wheels this project has never
+  seen get a default guess so they are not left unable to press anything, and this is how you correct it.
+- The binary is now `NCM-Wheel-Support.exe`. Spaces were being rewritten in the published asset name, so
+  `SHA256SUMS.txt` no longer matched the file people downloaded.
 
 ### 0.2.0
 

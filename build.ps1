@@ -7,7 +7,7 @@
   window and a manual start. This script does the first four; `-InstallStartup` does the fifth.
 
 .NOTES
-  Output: dist\NCM Wheel Support.exe  (windowed, no console)
+  Output: dist\NCM-Wheel-Support.exe  (windowed, no console)
 
   **Force output stays disarmed in the packaged build.** `--arm` is still required, exactly as it is when
   running from source, so shipping a build can never be the thing that first moves someone's wheel.
@@ -27,12 +27,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $source = Join-Path $root 'ncm-wheel.py'
-$name = 'NCM Wheel Support'
+$name = 'NCM-Wheel-Support'
 $exe = Join-Path $root "dist\$name.exe"
 
 # The Startup-folder shortcut is the whole "no manual start" story, and it is deliberately a shortcut rather
 # than a registry Run key or a service: a player can see it, and delete it, without being told how.
-$startupLink = Join-Path ([Environment]::GetFolderPath('Startup')) "$name.lnk"
+$startupLink = Join-Path ([Environment]::GetFolderPath('Startup')) 'NCM Wheel Support.lnk'
 
 if ($RemoveStartup) {
     if (Test-Path $startupLink) { Remove-Item $startupLink -Force; Write-Output "removed: $startupLink" }
@@ -61,8 +61,9 @@ Invoke-Native -Exe $python -Arguments @('-m','pip','install','--quiet','--upgrad
 # --windowed: no console. The companion is meant to be invisible; its readouts belong in the NCM panel.
 # --collect-all sdl2dll: pysdl2-dll ships SDL2.dll as package data, which PyInstaller will not find alone,
 # and without it the packaged build silently loses hardware discovery.
-$vgamepad = & $python -c "import site, os; print(os.path.join([p for p in site.getsitepackages() "
-                          + "if p.endswith('site-packages')][-1], 'vgamepad'))"
+$pyExpr = "import site, os; sp=[p for p in site.getsitepackages() if p.endswith('site-packages')][-1]; print(os.path.join(sp, 'vgamepad'))"
+$vgamepad = & $python -c $pyExpr
+if (-not (Test-Path $vgamepad)) { throw "vgamepad is not installed in $Venv -- run: .\.venv\Scripts\python tools-install-vgamepad.py" }
 $args = @(
     '-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile', '--windowed',
     '--name', $name,
