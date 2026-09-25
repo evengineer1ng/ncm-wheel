@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output -- the exe ships as a Release asset, not in the tree
+/dist/
+/build/
+*.spec
+
+# OS / editor
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

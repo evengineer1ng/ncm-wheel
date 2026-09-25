@@ -1,0 +1,1404 @@
+#!/usr/bin/env python3
+"""Reference force-feedback companion for NCM Online (IDEA-386).
+
+**This drives no hardware.** It is the shape JoyMoCo's side should take, and a harness for watching the
+telemetry arrive before any force is applied to a real wheel. It serves the bridge page, accepts the
+same-origin WebSocket, decodes frames and prints what it would have commanded.
+
+Architecture, proven live in MASTER_TEST section AJ (L129): a bundled OPEN//77 WebUI page has NO outbound
+network, so the direction is inverted. The companion serves an HTML page; NCM creates a surface whose `entry`
+is that URL; `Open77.webui.create` injects the Lua bridge into that origin; the page relays Lua events over a
+same-origin socket. No TLS, because loopback is already a secure context.
+
+    python tools/ffb-dev-companion.py [--port 38480] [--class belt]
+    then in game:  /ncm.ffb on
+
+--------------------------------------------------------------------------------------------------
+SAFETY -- the part to read before connecting a real wheel
+--------------------------------------------------------------------------------------------------
+This mirrors `ncm/core/driver/feedback.lua`, which is the authority and is covered by the gate. Keep the two
+in step; if they ever disagree, the Lua is right.
+
+**SDL haptic magnitude is normalised, and normalised is not equal.** A 0.5 constant force is about a
+newton-metre on a belt-drive G29 and about ten on a 20 Nm direct-drive base. The same number is a nudge on one
+device and a wrist injury on another. So:
+
+  * ceilings are per device CLASS, and the classes nobody here can test are held far below the ones we can;
+  * an unidentified device is assumed to be the most dangerous thing it could be;
+  * the rate of change is capped as well as the level, because a spike is what hurts, not a sustained level;
+  * tuning is a LADDER, not a slider -- fixed rungs, fixed small step, hard last rung.
+
+Owner's method, 2026-09-24: *"start at the lowest ffb settings, and increment slightly until further is
+unnecessary then STOP. An important feature for us should not cost any wrists."*
+"""
+from __future__ import annotations
+
+import argparse
+import atexit
+import base64
+import io
+import hashlib
+import json
+import os
+import socket
+import struct
+import sys
+import threading
+import time
+
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+CRLF = chr(13) + chr(10)
+
+FRAME_VERSION = 1
+
+# Mirror of driver.feedback. The Lua is authoritative.
+# Measured 2026-09-24 on a G29: the previous set was reasoned rather than tested, and a full-ladder run with
+# the constant centring effect was "fairly strong from first rung to too strong by the end". Lower floor,
+# finer steps, ceilings down by roughly 60%. Mirrors driver.feedback, which is authoritative.
+CEILING = {"gear": 0.24, "belt": 0.20, "direct_drive": 0.06, "unknown": 0.04}
+FLOOR = 0.02
+STEP = 0.02
+MAX_SLEW_PER_SECOND = 1.5
+
+
+def ladder(device_class: str) -> list[float]:
+    """Every permitted setting for a class, lowest first. A tuning session starts at [0] and stops the moment
+    another rung adds nothing."""
+    ceiling = CEILING.get(device_class)
+    if ceiling is None:
+        return []
+    out, v = [], FLOOR
+    while v <= ceiling + 1e-9:
+        out.append(round(v, 3))
+        v += STEP
+    return out
+
+
+def clamp(device_class: str, requested) -> float:
+    """The only way a magnitude leaves this module."""
+    ceiling = CEILING.get(device_class, CEILING["unknown"])
+    try:
+        v = float(requested)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v or v in (float("inf"), float("-inf")) or v < 0:
+        return 0.0
+    return min(v, ceiling)
+
+
+def slew(previous: float, target, dt: float, max_per_second: float = MAX_SLEW_PER_SECOND) -> float:
+    """No sudden full-scale step, ever. An unreadable target HOLDS rather than dropping to zero."""
+    try:
+        want = float(target)
+    except (TypeError, ValueError):
+        return previous
+    if want != want:
+        return previous
+    step = max_per_second * max(0.0, dt)
+    if step <= 0:
+        return previous
+    delta = want - previous
+    if delta > step:
+        return previous + step
+    if delta < -step:
+        return previous - step
+    return want
+
+
+# --------------------------------------------------------------------------------------------------
+# Device discovery. Reporting only -- nothing here opens a haptic effect.
+# --------------------------------------------------------------------------------------------------
+#
+# The companion is the only thing in the system that can see the hardware, so it is the only thing that may
+# describe it. **Classification decides the ceiling**, so getting it wrong in the permissive direction is the
+# one mistake that matters: anything not confidently recognised stays `unknown`, which carries the lowest cap.
+#
+# Name matching is crude on purpose. A curated list of substrings we can defend beats a clever heuristic that
+# might promote an unknown direct-drive base into the `belt` ceiling.
+BELT_OR_GEAR = {
+    "g29": "gear", "g920": "gear", "g923": "gear", "g27": "gear", "g25": "gear", "driving force": "gear",
+    "t300": "belt", "t150": "belt", "tmx": "belt", "t500": "belt", "thrustmaster": "belt",
+    "csl elite": "belt", "clubsport": "belt",
+}
+DIRECT_DRIVE = ("moza", "simucube", "simagic", "fanatec dd", "podium", "csl dd", "vrs ", "asetek", "cammus")
+
+
+def classify(name: str) -> str:
+    """A device class, or `unknown`. **Never guesses upward.**"""
+    n = (name or "").lower()
+    for token in DIRECT_DRIVE:
+        if token in n:
+            return "direct_drive"
+    for token, cls in BELT_OR_GEAR.items():
+        if token in n:
+            return cls
+    return "unknown"
+
+
+def discover():
+    """The first haptic-capable device SDL can see, described but NOT opened for output.
+
+    Returns (name, class, capabilities dict) or (None, "unknown", {}). An import failure is reported rather
+    than crashing the bridge: telemetry is still worth watching on a machine with no wheel attached.
+    """
+    try:
+        import sdl2
+    except Exception as exc:                                    # noqa: BLE001 - diagnostic path
+        print("[ffb] SDL unavailable (%s); running without hardware discovery" % exc, flush=True)
+        return None, "unknown", {}
+    try:
+        sdl2.SDL_InitSubSystem(sdl2.SDL_INIT_JOYSTICK | sdl2.SDL_INIT_HAPTIC)
+        count = sdl2.SDL_NumHaptics()
+        if count < 1:
+            print("[ffb] SDL sees no haptic device. On Logitech wheels G HUB must be installed and running.",
+                  flush=True)
+            return None, "unknown", {}
+        for i in range(count):
+            raw_i = sdl2.SDL_HapticName(i)
+            nm_i = raw_i.decode(errors="replace") if isinstance(raw_i, bytes) else str(raw_i)
+            print("[ffb] haptic %d: %s" % (i, nm_i), flush=True)
+        raw = sdl2.SDL_HapticName(0)
+        name = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+        dev = sdl2.SDL_HapticOpen(0)
+        caps = {}
+        if dev:
+            bits = sdl2.SDL_HapticQuery(dev)
+            for label, flag in (("constant", sdl2.SDL_HAPTIC_CONSTANT), ("sine", sdl2.SDL_HAPTIC_SINE),
+                                ("leftright", sdl2.SDL_HAPTIC_LEFTRIGHT), ("damper", sdl2.SDL_HAPTIC_DAMPER),
+                                ("spring", sdl2.SDL_HAPTIC_SPRING)):
+                caps[label] = bool(bits & flag)
+            # Closed again immediately. Discovery must not leave a device held open by a process that is not
+            # going to drive it.
+            sdl2.SDL_HapticClose(dev)
+        return name, classify(name), caps
+    except Exception as exc:                                    # noqa: BLE001 - diagnostic path
+        print("[ffb] device discovery failed: %s" % exc, flush=True)
+        return None, "unknown", {}
+
+
+BRIDGE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>NCM FFB bridge</title></head>
+<body style="margin:0;background:transparent">
+<script>
+// The whole page. It owns no policy and makes no decisions -- it relays Lua events to a same-origin socket
+// and reports the socket's state back to Lua, so the client knows whether a companion is actually listening.
+(function () {
+  var ws = null, ready = false;
+  var tell = function (event, detail) {
+    try { if (window.Open77 && Open77.emit) Open77.emit(event, { detail: String(detail) }); } catch (e) {}
+  };
+  var connect = function () {
+    try {
+      ws = new WebSocket("ws://" + location.host + "/telemetry");
+    } catch (e) { tell("ncm:ffb.closed", "construct failed: " + e); return; }
+    ws.onopen = function () { ready = true; tell("ncm:ffb.ready", location.origin); };
+    // Upward: whatever the companion says about the hardware. Passed through untouched -- this page owns no
+    // policy and must not be the place a device class quietly changes.
+    ws.onmessage = function (ev) {
+      try {
+        var msg = JSON.parse(ev.data);
+        if (msg && msg.device && window.Open77 && Open77.emit) Open77.emit("ncm:ffb.device", msg.device);
+      } catch (e) {}
+    };
+    ws.onclose = function () { ready = false; tell("ncm:ffb.closed", "socket closed"); setTimeout(connect, 2000); };
+    ws.onerror = function () { ready = false; };
+  };
+  var relay = function (payload) {
+    if (!ready || !ws) return;
+    try { ws.send(JSON.stringify(payload)); } catch (e) {}
+  };
+  if (window.Open77 && Open77.on) {
+    Open77.on("ncm:ffb.frame", relay);
+    // `idle` is sent deliberately instead of going quiet: silence and "no force" are different instructions,
+    // and a companion holding the last frame would keep pushing at a wheel whose car it can no longer see.
+    Open77.on("ncm:ffb.idle", function (p) { relay({ v: (p && p.v) || 1, idle: true }); });
+    // Downward: panel settings and the test pulse take the SAME socket the telemetry came up. One transport,
+    // so the two sides cannot disagree about which is authoritative.
+    Open77.on("ncm:ffb.settings", function (p) { relay({ cmd: "settings", settings: p || {} }); });
+    Open77.on("ncm:ffb.test", function (p) { relay({ cmd: "test", test: p || {} }); });
+  }
+  connect();
+})();
+</script>
+</body></html>
+"""
+
+
+def _accept_key(key: str) -> str:
+    return base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
+
+
+def _read_frame(conn: socket.socket):
+    head = conn.recv(2)
+    if len(head) < 2:
+        return None
+    opcode = head[0] & 0x0F
+    masked = bool(head[1] & 0x80)
+    length = head[1] & 0x7F
+    if length == 126:
+        length = struct.unpack(">H", conn.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack(">Q", conn.recv(8))[0]
+    mask = conn.recv(4) if masked else b"\x00\x00\x00\x00"
+    payload = b""
+    while len(payload) < length:
+        chunk = conn.recv(length - len(payload))
+        if not chunk:
+            break
+        payload += chunk
+    return opcode, bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+# --------------------------------------------------------------------------------------------------
+# Input: wheel and pedals -> one virtual Xbox 360 pad.
+# --------------------------------------------------------------------------------------------------
+#
+# **This is what makes the support native rather than a companion hack.** Cyberpunk reads an ordinary Xbox
+# controller; ViGEmBus lets us present one; SDL reads the real hardware. Nothing about it is NCM-specific,
+# which is the point -- the wheel steers the car in menus, in free roam and in someone else's gamemode, not
+# only while NCM is looking.
+#
+# Observed on this machine, game and JoyMoCo both closed:
+#     joystick 0  "Sim Pedals"                                   3 axes, all resting at -32768
+#     joystick 1  "Logitech G HUB G29 ... Racing Wheel USB"       4 axes, wheel centred at 0
+# So pedals are a SEPARATE device from the wheel, and a pedal at rest reads minimum rather than centre.
+
+# --------------------------------------------------------------------------------------------------
+# Input: a rig, a gamepad, or both -> one virtual Xbox 360 pad.
+# --------------------------------------------------------------------------------------------------
+#
+# **Nothing about anyone's hardware is hardcoded here.** This is going on a public server, so a rig that
+# nobody here has ever seen has to work. Roles are decided by SHAPE, and a profile file only supplies what
+# shape cannot tell you -- which button on an unlabelled rim is `a`.
+#
+#   steering  an axis that rests near centre and travels both ways
+#   pedals    axes that rest at one END of travel
+#   rim       many buttons and no usable axes
+#   gamepad   anything SDL's own GameController database recognises
+#
+# That last one matters most: a standard Xbox pad needs **no profile and no mapping**, because SDL already
+# knows it. The owner's custom rim needs a profile because no database will ever contain it.
+#
+# **The gamepad is never displaced by the rig.** Both feed the same virtual pad and the larger deflection
+# wins, so a driver can hold a controller in their hands and keep the wheel in front of them. On foot the rig
+# is suppressed entirely -- a wheel should not be nudging the walk axis while you are walking.
+
+PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wheel-profiles")
+
+# A button box or rim reports no useful name on some hardware (the owner's reads as "axis 28 button device"),
+# so it is recognised by shape as well: many buttons and no axes that behave like controls.
+RIM_HINTS = ("evenracing", "button device", "button box", "rim", "wheelbase buttons")
+
+BUTTON_NAMES = ("a", "b", "x", "y", "lb", "rb", "back", "start", "home", "ls", "rs",
+                "dpad_up", "dpad_down", "dpad_left", "dpad_right")
+
+
+def load_profiles(path=None):
+    """Every profile we can find, plus the defaults block. Missing or broken files are not fatal: a rig
+    still steers without a profile, and refusing to start over a JSON typo would be a poor trade."""
+    path = path or os.path.join(PROFILE_DIR, "default.json")
+    try:
+        with io.open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get("defaults", {}), data.get("profiles", [])
+    except Exception as exc:                                    # noqa: BLE001 - diagnostic path
+        print("[in ] no rig profiles loaded (%s); detection only" % exc, flush=True)
+        return {}, []
+
+
+def match_profile(name, profiles, role=None):
+    low = (name or "").lower()
+    best = None
+    for p in profiles:
+        if role and p.get("role") != role:
+            continue
+        for token in p.get("match", []):
+            if token.lower() in low:
+                # Longest match wins, so "fanatec dd" beats "fanatec".
+                if best is None or len(token) > best[0]:
+                    best = (len(token), p)
+    return best[1] if best else None
+
+
+class Device:
+    """One physical thing, with the role we decided it plays."""
+
+    def __init__(self, index, name, handle, role, profile=None):
+        self.index, self.name, self.handle = index, name, handle
+        self.role, self.profile = role, profile or {}
+        self.rest = {}
+        self.polled = False
+
+
+class Input:
+    """Reads whatever is attached and drives a virtual Xbox 360 pad.
+
+    **Steering range is the setting people will actually argue about.** A 900-degree wheel mapped one-to-one
+    onto a thumbstick gives a car that barely turns -- full deflection would need half a turn. Only the middle
+    is used: `steer_degrees` per side maps to full deflection, the rest clamps. 45 is one driver's comfort,
+    not a fact, so it is adjustable live from the NCM panel.
+    """
+
+    def __init__(self, steer_degrees=45.0, wheel_range=900.0, profile_path=None):
+        self.steer_degrees = max(5.0, float(steer_degrees))
+        self.wheel_range = max(90.0, float(wheel_range))
+        self.defaults, self.profiles = load_profiles(profile_path)
+        self.steer_deadzone = float(self.defaults.get("steer_deadzone", 0.015))
+        self.steer_curve = float(self.defaults.get("steer_curve", 1.3))
+        self.pad_deadzone = float(self.defaults.get("gamepad_deadzone", 0.08))
+        self.sdl = None
+        self.vg = None
+        self.pad = None
+        self.devices = []
+        self.controllers = []
+        self.steering = self.pedals = self.rim = None
+        self.steer_axis = 0
+        self.pedal_axes = {}
+        self.detected_class = "unknown"
+        self.running = False
+        self.thread = None
+        self.last = {}
+        self.pressed = set()
+        # **Seat gating.** None means "NCM has not told us anything", and the rig stays live -- the companion
+        # must be useful on its own. Only an explicit `False` from a connected bridge suppresses it.
+        self.seated = None
+
+    @property
+    def scale(self):
+        return (self.wheel_range / 2.0) / self.steer_degrees
+
+    def set_steer_degrees(self, degrees):
+        self.steer_degrees = max(5.0, min(540.0, float(degrees)))
+        return self.steer_degrees
+
+    # ---------------------------------------------------------------- detection
+    def _rest_values(self, sdl2, handle, n_axes):
+        """Where every axis sits when nobody is touching it.
+
+        **The first read after opening is a lie** -- SDL reports 0 for every axis until it has actually
+        polled, and believing that made a released pedal look fully pressed, with the virtual pad holding
+        full throttle and full brake at once. So poll until something is non-zero, or give up after two
+        seconds and say so."""
+        deadline = time.monotonic() + 2.0
+        values = [0] * n_axes
+        while time.monotonic() < deadline:
+            sdl2.SDL_JoystickUpdate()
+            values = [sdl2.SDL_JoystickGetAxis(handle, a) for a in range(n_axes)]
+            if any(v != 0 for v in values):
+                return values, True
+            time.sleep(0.02)
+        return values, False
+
+    def _classify_axes(self, values):
+        """Which axes are steering and which are pedals, by where they REST.
+
+        A steering axis sits at centre and travels both ways. A pedal sits at one end of its travel. That
+        distinction is what a device name cannot tell you and what every rig has in common, so it is the
+        thing worth testing."""
+        centred, pedals = [], []
+        for axis, v in enumerate(values):
+            if abs(v) < 4000:
+                centred.append(axis)
+            elif abs(v) > 24000:
+                pedals.append(axis)
+        return centred, pedals
+
+    def open(self):
+        try:
+            import sdl2
+            import vgamepad as vg
+        except Exception as exc:                                # noqa: BLE001 - diagnostic path
+            return "input unavailable: %s (is ViGEmBus installed?)" % exc
+        self.sdl, self.vg = sdl2, vg
+        try:
+            sdl2.SDL_Init(sdl2.SDL_INIT_JOYSTICK | sdl2.SDL_INIT_GAMECONTROLLER)
+            sdl2.SDL_JoystickEventState(sdl2.SDL_IGNORE)
+            sdl2.SDL_GameControllerEventState(sdl2.SDL_IGNORE)
+
+            for i in range(sdl2.SDL_NumJoysticks()):
+                raw = sdl2.SDL_JoystickNameForIndex(i)
+                nm = (raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw))
+                # **A recognised gamepad is taken as a gamepad and never taken apart.** SDL's own database
+                # already knows which button is `a` on an Xbox pad; re-deriving that would be worse.
+                if sdl2.SDL_IsGameController(i):
+                    ctrl = sdl2.SDL_GameControllerOpen(i)
+                    if ctrl:
+                        self.controllers.append((nm, ctrl))
+                        print("[in ] gamepad : %d %s (SDL mapping)" % (i, nm), flush=True)
+                        continue
+                handle = sdl2.SDL_JoystickOpen(i)
+                if not handle:
+                    continue
+
+                profile = match_profile(nm, self.profiles)
+                n_axes = sdl2.SDL_JoystickNumAxes(handle)
+                n_buttons = sdl2.SDL_JoystickNumButtons(handle)
+                values, polled = self._rest_values(sdl2, handle, n_axes)
+                ignore = set((profile or {}).get("ignore_axes") or [])
+                usable = [v if a not in ignore else 0 for a, v in enumerate(values)]
+                centred, pedal_axes = self._classify_axes(usable)
+                for a in ignore:
+                    if a in centred:
+                        centred.remove(a)
+                dev = Device(i, nm, handle, "", profile)
+                dev.rest = {a: values[a] for a in range(n_axes)}
+                dev.polled = polled
+                tag = (profile or {}).get("name")
+                roles = []
+
+                # **One device can hold two roles.** A Thrustmaster presents wheel and pedals together.
+                if self.steering is None and centred and n_buttons < 26:
+                    axis = (profile or {}).get("axes", {}).get("steer", centred[0])
+                    self.steering, self.steer_axis = dev, axis
+                    self.detected_class = (profile or {}).get("device_class", "unknown")
+                    roles.append("steering ax%d" % axis)
+                if pedal_axes and self.pedals is None:
+                    self.pedals = dev
+                    mapped = (profile or {}).get("axes") or {}
+                    for which, fallback in (("throttle", 0), ("brake", 1), ("clutch", 2)):
+                        if which in mapped:
+                            self.pedal_axes[which] = mapped[which]
+                        elif fallback < len(pedal_axes):
+                            # Convention for a combined wheel, in axis order: throttle, brake, clutch. It is
+                            # a guess, so it is PRINTED -- a tester who finds them swapped can say so, and
+                            # a profile entry then makes it permanent for that hardware.
+                            self.pedal_axes[which] = pedal_axes[fallback]
+                    roles.append("pedals " + ", ".join(
+                        "%s=ax%s" % (k, v) for k, v in sorted(self.pedal_axes.items())))
+                if not roles and self.rim is None and (
+                        (profile or {}).get("role") == "rim" or
+                        any(h in nm.lower() for h in RIM_HINTS) or (n_buttons >= 26 and not pedal_axes)):
+                    self.rim = dev
+                    roles.append("%d buttons" % n_buttons)
+
+                if roles:
+                    print("[in ] %-8s: %d %s%s -- %s"
+                          % ("device", i, nm, (" [%s]" % tag) if tag else " [detected]", "; ".join(roles)),
+                          flush=True)
+                    self.devices.append(dev)
+                else:
+                    sdl2.SDL_JoystickClose(handle)
+
+            if self.steering is None and not self.controllers:
+                return "nothing usable attached"
+
+            self.pad = vg.VX360Gamepad()
+            self._calibrate_pedals()
+            return ""
+        except Exception as exc:                                # noqa: BLE001 - diagnostic path
+            return "input open failed: %s" % exc
+
+    def _calibrate_pedals(self):
+        """Rest positions are learned during detection; this only reports them and covers the case where SDL
+        never answered at all."""
+        if self.pedals is None:
+            return
+        if not self.pedals.polled:
+            fallback = int(self.pedals.profile.get("released", -32768))
+            for axis in self.pedal_axes.values():
+                self.pedals.rest[axis] = fallback
+            print("[in ] pedal rest: SDL never reported; assuming %d released" % fallback, flush=True)
+            return
+        print("[in ] pedal rest: %s (feet off while this starts)"
+              % ({k: self.pedals.rest.get(v) for k, v in sorted(self.pedal_axes.items())},), flush=True)
+
+    # ---------------------------------------------------------------- reading
+    def _pedal(self, which):
+        if self.pedals is None:
+            return 0.0
+        axis = self.pedal_axes.get(which)
+        if axis is None or axis not in self.pedals.rest:
+            return 0.0
+        v = self.sdl.SDL_JoystickGetAxis(self.pedals.handle, axis)
+        rest = self.pedals.rest[axis]
+        span = 65535.0 if abs(rest) > 16384 else 32767.0
+        return max(0.0, min(1.0, abs(v - rest) / span))
+
+    def _steer(self):
+        if self.steering is None:
+            return 0.0
+        raw = self.sdl.SDL_JoystickGetAxis(self.steering.handle, self.steer_axis) / 32767.0
+        value = max(-1.0, min(1.0, raw * self.scale))
+        if abs(value) < self.steer_deadzone:
+            return 0.0
+        if self.steer_curve != 1.0:
+            value = (1.0 if value > 0 else -1.0) * (abs(value) ** self.steer_curve)
+        return value
+
+    def _gamepad_state(self):
+        """Whatever the handheld controller is doing, through SDL's own mapping."""
+        sdl2 = self.sdl
+        state = {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0, "lt": 0.0, "rt": 0.0, "buttons": set()}
+        axis_map = {"lx": sdl2.SDL_CONTROLLER_AXIS_LEFTX, "ly": sdl2.SDL_CONTROLLER_AXIS_LEFTY,
+                    "rx": sdl2.SDL_CONTROLLER_AXIS_RIGHTX, "ry": sdl2.SDL_CONTROLLER_AXIS_RIGHTY}
+        btn_map = {"a": sdl2.SDL_CONTROLLER_BUTTON_A, "b": sdl2.SDL_CONTROLLER_BUTTON_B,
+                   "x": sdl2.SDL_CONTROLLER_BUTTON_X, "y": sdl2.SDL_CONTROLLER_BUTTON_Y,
+                   "lb": sdl2.SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
+                   "rb": sdl2.SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+                   "back": sdl2.SDL_CONTROLLER_BUTTON_BACK, "start": sdl2.SDL_CONTROLLER_BUTTON_START,
+                   "home": sdl2.SDL_CONTROLLER_BUTTON_GUIDE,
+                   "ls": sdl2.SDL_CONTROLLER_BUTTON_LEFTSTICK,
+                   "rs": sdl2.SDL_CONTROLLER_BUTTON_RIGHTSTICK,
+                   "dpad_up": sdl2.SDL_CONTROLLER_BUTTON_DPAD_UP,
+                   "dpad_down": sdl2.SDL_CONTROLLER_BUTTON_DPAD_DOWN,
+                   "dpad_left": sdl2.SDL_CONTROLLER_BUTTON_DPAD_LEFT,
+                   "dpad_right": sdl2.SDL_CONTROLLER_BUTTON_DPAD_RIGHT}
+        for _, ctrl in self.controllers:
+            for key, axis in axis_map.items():
+                v = sdl2.SDL_GameControllerGetAxis(ctrl, axis) / 32767.0
+                # **Stick drift is not steering.** A resting Xbox pad reported 0.032 here, and because the
+                # merge takes the larger deflection that drift beat a perfectly centred wheel and put a
+                # permanent lean into the car. Deadzone first, merge second.
+                if abs(v) < self.pad_deadzone:
+                    v = 0.0
+                if abs(v) > abs(state[key]):
+                    state[key] = max(-1.0, min(1.0, v))
+            for key, axis in (("lt", sdl2.SDL_CONTROLLER_AXIS_TRIGGERLEFT),
+                              ("rt", sdl2.SDL_CONTROLLER_AXIS_TRIGGERRIGHT)):
+                v = max(0.0, sdl2.SDL_GameControllerGetAxis(ctrl, axis) / 32767.0)
+                if v < self.pad_deadzone:
+                    v = 0.0
+                state[key] = max(state[key], v)
+            for name, btn in btn_map.items():
+                if sdl2.SDL_GameControllerGetButton(ctrl, btn):
+                    state["buttons"].add(name)
+        return state
+
+    def _rim_buttons(self):
+        """Rim buttons, per profile. No profile means no rim buttons -- guessing which one is `a` on an
+        unknown rim could bind `home` to a paddle and drop a player out of the game."""
+        out = set()
+        if self.rim is None:
+            return out
+        mapping = self.rim.profile.get("buttons") or {}
+        ignored = set(self.rim.profile.get("ignore_buttons") or [])
+        for raw_index, target in mapping.items():
+            index = int(raw_index)
+            if index in ignored or target not in BUTTON_NAMES:
+                continue
+            if self.sdl.SDL_JoystickGetButton(self.rim.handle, index):
+                out.add(target)
+        return out
+
+    # ---------------------------------------------------------------- output
+    def _tick(self):
+        sdl2 = self.sdl
+        sdl2.SDL_JoystickUpdate()
+        sdl2.SDL_GameControllerUpdate()
+
+        pad_state = self._gamepad_state()
+        # On foot, the rig contributes nothing. Only an explicit `False` from a connected NCM suppresses it;
+        # `None` means nobody has said, and the companion has to work on its own.
+        rig_live = self.seated is not False
+        steer = self._steer() if rig_live else 0.0
+        throttle = self._pedal("throttle") if rig_live else 0.0
+        brake = self._pedal("brake") if rig_live else 0.0
+        rim = self._rim_buttons() if rig_live else set()
+
+        # Larger deflection wins, so holding a controller never fights the wheel in front of you.
+        lx = steer if abs(steer) >= abs(pad_state["lx"]) else pad_state["lx"]
+        rt = max(throttle, pad_state["rt"])
+        lt = max(brake, pad_state["lt"])
+        held = rim | pad_state["buttons"]
+
+        self.pad.left_joystick_float(x_value_float=lx, y_value_float=-pad_state["ly"])
+        self.pad.right_joystick_float(x_value_float=pad_state["rx"], y_value_float=-pad_state["ry"])
+        self.pad.right_trigger_float(value_float=rt)
+        self.pad.left_trigger_float(value_float=lt)
+
+        for name in BUTTON_NAMES:
+            target = getattr(self.vg.XUSB_BUTTON, "XUSB_GAMEPAD_" + {
+                "lb": "LEFT_SHOULDER", "rb": "RIGHT_SHOULDER", "home": "GUIDE",
+                "ls": "LEFT_THUMB", "rs": "RIGHT_THUMB",
+                "dpad_up": "DPAD_UP", "dpad_down": "DPAD_DOWN",
+                "dpad_left": "DPAD_LEFT", "dpad_right": "DPAD_RIGHT",
+            }.get(name, name.upper()))
+            if name in held and name not in self.pressed:
+                self.pressed.add(name)
+                self.pad.press_button(button=target)
+            elif name not in held and name in self.pressed:
+                self.pressed.discard(name)
+                self.pad.release_button(button=target)
+
+        self.pad.update()
+        self.last = {"steer": lx, "throttle": rt, "brake": lt, "rig": rig_live,
+                     "buttons": sorted(self.pressed)}
+
+    def start(self):
+        if self.running or self.pad is None:
+            return
+        self.running = True
+
+        def loop():
+            # 120 Hz. Steering latency is the one thing a driver feels directly.
+            while self.running:
+                try:
+                    self._tick()
+                except Exception:                               # noqa: BLE001 - never let input die silently
+                    pass
+                time.sleep(1.0 / 120.0)
+
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+        print("[in ] steering %.0f deg/side (range %.0f, x%.1f, curve %.1f) | %d gamepad(s) merged"
+              % (self.steer_degrees, self.wheel_range, self.scale, self.steer_curve, len(self.controllers)),
+              flush=True)
+
+    def describe(self):
+        return {
+            "steering": self.steering.name if self.steering else None,
+            "pedals": self.pedals.name if self.pedals else None,
+            "rim": self.rim.name if self.rim else None,
+            "gamepads": [n for n, _ in self.controllers],
+            "steerDegrees": self.steer_degrees,
+            "wheelRange": self.wheel_range,
+            "rigLive": self.seated is not False,
+            "pedalAxes": dict(self.pedal_axes),
+            "steerAxis": self.steer_axis,
+        }
+
+    def stop(self):
+        """Release everything. A virtual pad left holding a trigger is a car left accelerating."""
+        self.running = False
+        try:
+            if self.pad is not None:
+                self.pad.reset()
+                self.pad.update()
+        except Exception:                                       # noqa: BLE001
+            pass
+
+
+class Output:
+    """The only thing in this program that can move a wheel.
+
+    **Two effects, because a wheel is not a gamepad.**
+
+      * `CONSTANT` -- a directional torque, used as *self-aligning torque*: the wheel loading up as you turn
+        and wanting to return to centre. This is what hands actually read, and a sine alone reads as nothing.
+        The direction always points BACK TOWARD CENTRE, so it assists the driver the way a real car does
+        rather than fighting them. That is why a constant effect is safe here despite being refused in the
+        first draft: the danger was never the effect type, it was an arbitrary direction.
+      * `SINE` at 125 Hz -- surface texture and slip, layered on top. 25 Hz was the first attempt and it is
+        slow enough that a wheel's inertia swallows it; 125 Hz is what `anyffb` uses on this exact hardware.
+
+    **Cleanup is the part that went wrong in the first version and must not go wrong again.** The owner's
+    wheel was left powered, pulled fully to one side, resisting return to centre -- after `stop()` had been
+    called, the process had exited, and the device had been closed. `SDL_HapticNumEffectsPlaying` still read
+    1. `SDL_HapticStopAll` does not reliably end an infinite effect; the effect must be zeroed, stopped AND
+    destroyed, and the whole thing registered with `atexit` so a crash cannot skip it.
+    """
+
+    def __init__(self, device_class):
+        self.device_class = device_class
+        self.sdl = None
+        self.haptic = None
+        self.name = None
+        self.caps = {}
+        self.index = None
+        self.opened_index = None
+        self.dev = None
+        self.mode = "none"
+        self.sine = self.sine_id = None
+        self.const = self.const_id = None
+        self.conditions = {}
+        self.axes = 1
+        self.last_texture = -1.0
+        self.last_torque = None
+        self._registered = False
+
+    # ---------------------------------------------------------------- lifecycle
+    def open(self):
+        try:
+            import sdl2
+            import sdl2.haptic as haptic
+            from ctypes import c_long
+        except Exception as exc:                                # noqa: BLE001 - diagnostic path
+            return "SDL unavailable: %s" % exc
+        self.sdl, self.haptic = sdl2, haptic
+        try:
+            if sdl2.SDL_Init(sdl2.SDL_INIT_HAPTIC) != 0:
+                return "SDL_Init(HAPTIC) failed: %s" % sdl2.SDL_GetError()
+            count = haptic.SDL_NumHaptics()
+            if count < 1:
+                return "no haptic device"
+
+            attempts = []
+            for i in range(count):
+                if self.index is not None and i != self.index:
+                    continue
+                raw = haptic.SDL_HapticName(i)
+                nm = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+                dev = haptic.SDL_HapticOpen(i)
+                if not dev:
+                    err = sdl2.SDL_GetError()
+                    err = err.decode(errors="replace") if isinstance(err, bytes) else str(err)
+                    attempts.append("%d:%s (%s)" % (i, nm, err.strip()))
+                    print("[ffb] haptic %d: %s -- refused (%s)" % (i, nm, err.strip()), flush=True)
+                    if not self.name:
+                        self.name = nm
+                    continue
+                # **Opening is not the test; creating an effect is.** This wheel enumerates three times and
+                # the middle one opens while being able to create nothing at all -- which looks like success
+                # and is worse than a refusal.
+                probe = self._sine_effect(c_long, 0)
+                pid = haptic.SDL_HapticNewEffect(dev, probe)
+                if pid >= 0:
+                    haptic.SDL_HapticDestroyEffect(dev, pid)
+                    self.name, self.dev, self.opened_index = nm, dev, i
+                    print("[ffb] haptic %d: %s -- USABLE" % (i, nm), flush=True)
+                    break
+                haptic.SDL_HapticClose(dev)
+                attempts.append("%d:%s (opens, cannot create effects)" % (i, nm))
+                print("[ffb] haptic %d: %s -- opens but creates nothing" % (i, nm), flush=True)
+                if not self.name:
+                    self.name = nm
+            if not self.dev:
+                return "no haptic index would open -- tried %s" % "; ".join(attempts)
+
+            bits = haptic.SDL_HapticQuery(self.dev)
+            self.caps = {
+                "constant": bool(bits & haptic.SDL_HAPTIC_CONSTANT),
+                "sine": bool(bits & haptic.SDL_HAPTIC_SINE),
+                "leftright": bool(bits & haptic.SDL_HAPTIC_LEFTRIGHT),
+                "damper": bool(bits & haptic.SDL_HAPTIC_DAMPER),
+                "spring": bool(bits & haptic.SDL_HAPTIC_SPRING),
+                "friction": bool(bits & haptic.SDL_HAPTIC_FRICTION),
+            }
+            haptic.SDL_HapticSetGain(self.dev, 100)
+            self.axes = max(1, haptic.SDL_HapticNumAxes(self.dev))
+            print("[ffb] device axes: %d | effects: %d stored, %d playing"
+                  % (self.axes, haptic.SDL_HapticNumEffects(self.dev),
+                     haptic.SDL_HapticNumEffectsPlaying(self.dev)), flush=True)
+
+            modes = []
+            if self.caps["sine"]:
+                self.sine = self._sine_effect(c_long, 0)
+                self.sine_id = haptic.SDL_HapticNewEffect(self.dev, self.sine)
+                if self.sine_id >= 0:
+                    haptic.SDL_HapticRunEffect(self.dev, self.sine_id, 1)
+                    modes.append("sine")
+                else:
+                    self.sine = self.sine_id = None
+            if self.caps["constant"]:
+                self.const = self._constant_effect(c_long, 0)
+                self.const_id = haptic.SDL_HapticNewEffect(self.dev, self.const)
+                if self.const_id >= 0:
+                    haptic.SDL_HapticRunEffect(self.dev, self.const_id, 1)
+                    modes.append("constant")
+                else:
+                    self.const = self.const_id = None
+            # **Condition effects are what stiffness IS.** The device computes these from its own position
+            # and velocity, continuously. Nothing we send per frame can imitate that, which is why the first
+            # version felt floaty no matter how the force channels were tuned.
+            for kind, attr in (("spring", "SPRING"), ("damper", "DAMPER")):
+                if not self.caps.get(kind):
+                    continue
+                eff = self._condition_effect(c_long, getattr(haptic, "SDL_HAPTIC_" + attr), 0.0)
+                eid = haptic.SDL_HapticNewEffect(self.dev, eff)
+                if eid >= 0:
+                    haptic.SDL_HapticRunEffect(self.dev, eid, 1)
+                    self.conditions[kind] = (eff, eid)
+                    modes.append(kind)
+
+            if not modes:
+                return "device created no usable effect"
+            self.mode = "+".join(modes)
+
+            if not self._registered:
+                atexit.register(self.close)
+                self._registered = True
+            return ""
+        except Exception as exc:                                # noqa: BLE001 - diagnostic path
+            return "haptic open failed: %s" % exc
+
+    def _sine_effect(self, c_long, magnitude):
+        h = self.haptic
+        e = h.SDL_HapticEffect()
+        e.type = h.SDL_HAPTIC_SINE
+        e.periodic.type = h.SDL_HAPTIC_SINE
+        e.periodic.direction = h.SDL_HapticDirection(h.SDL_HAPTIC_CARTESIAN, (c_long * 3)(1, 0, 0))
+        e.periodic.length = 0xFFFFFFFF
+        e.periodic.period = 8                                   # 125 Hz: texture. 25 Hz was swallowed whole.
+        e.periodic.magnitude = int(magnitude)
+        e.periodic.offset = 0
+        e.periodic.phase = 0
+        return e
+
+    def _condition_effect(self, c_long, kind, strength):
+        """A SPRING or DAMPER at `strength` 0..1.
+
+        **Configured for the axes the device actually has, which on a wheel is ONE.** The first version wrote
+        parameters for three axes on the assumption that a spare axis is harmless. It is not: force feedback
+        worked before spring and damper were added and was completely silent afterwards, because writing
+        condition parameters for axes that do not exist takes the whole device down. `SDL_HapticNumAxes`
+        reports 1 for this G29, and asking is free."""
+        h = self.haptic
+        e = h.SDL_HapticEffect()
+        e.type = kind
+        e.condition.type = kind
+        e.condition.direction = h.SDL_HapticDirection(h.SDL_HAPTIC_CARTESIAN, (c_long * 3)(1, 0, 0))
+        e.condition.length = 0xFFFFFFFF
+        sat = int(max(0.0, min(1.0, strength)) * 32767)
+        for axis in range(self.axes):
+            e.condition.right_sat[axis] = sat
+            e.condition.left_sat[axis] = sat
+            e.condition.right_coeff[axis] = sat
+            e.condition.left_coeff[axis] = sat
+            e.condition.deadband[axis] = 0
+            e.condition.center[axis] = 0
+        return e
+
+    def set_condition(self, kind, strength):
+        """Move a spring or damper. Called when a slider moves, never per frame -- the whole point is that
+        the device does this work itself."""
+        entry = self.conditions.get(kind)
+        if not entry or self.haptic is None or self.dev is None:
+            return False
+        eff, eid = entry
+        sat = int(max(0.0, min(1.0, strength)) * 32767)
+        for axis in range(self.axes):
+            eff.condition.right_sat[axis] = sat
+            eff.condition.left_sat[axis] = sat
+            eff.condition.right_coeff[axis] = sat
+            eff.condition.left_coeff[axis] = sat
+        try:
+            self.haptic.SDL_HapticUpdateEffect(self.dev, eid, eff)
+            return True
+        except Exception:                                       # noqa: BLE001
+            return False
+
+    def _constant_effect(self, c_long, level):
+        h = self.haptic
+        e = h.SDL_HapticEffect()
+        e.type = h.SDL_HAPTIC_CONSTANT
+        e.constant.type = h.SDL_HAPTIC_CONSTANT
+        e.constant.direction = h.SDL_HapticDirection(h.SDL_HAPTIC_CARTESIAN, (c_long * 3)(1, 0, 0))
+        e.constant.length = 0xFFFFFFFF
+        e.constant.level = int(level)
+        return e
+
+    # ---------------------------------------------------------------- output
+    def write(self, texture, torque=0.0):
+        """`texture` 0..1 of buzz; `torque` -1..1 of centring force, sign carrying which way to push.
+
+        Both are clamped here as well as by the caller. The redundant `min()` costs nothing and this is the
+        last place a mistake is still cheap."""
+        if self.mode == "none" or self.sdl is None:
+            return
+        texture = clamp(self.device_class, texture)
+        ceiling = CEILING.get(self.device_class, CEILING["unknown"])
+        torque = max(-ceiling, min(ceiling, torque if torque == torque else 0.0))
+        try:
+            if self.sine_id is not None and abs(texture - self.last_texture) >= 0.005:
+                self.last_texture = texture
+                self.sine.periodic.magnitude = int(texture * 32767)
+                self.haptic.SDL_HapticUpdateEffect(self.dev, self.sine_id, self.sine)
+            if self.const_id is not None and (self.last_torque is None
+                                              or abs(torque - self.last_torque) >= 0.005):
+                self.last_torque = torque
+                self.const.constant.level = int(torque * 32767)
+                self.haptic.SDL_HapticUpdateEffect(self.dev, self.const_id, self.const)
+        except Exception:                                       # noqa: BLE001 - never let output kill the loop
+            self.stop()
+
+    def stop(self):
+        """Silence. **Zero, then stop** -- an infinite effect that is merely 'stopped' has been observed to
+        keep playing, so the magnitude is set to zero first and the effect is halted second."""
+        self.last_texture, self.last_torque = -1.0, None
+        if self.haptic is None or self.dev is None:
+            return
+        try:
+            if self.sine_id is not None:
+                self.sine.periodic.magnitude = 0
+                self.haptic.SDL_HapticUpdateEffect(self.dev, self.sine_id, self.sine)
+                self.haptic.SDL_HapticStopEffect(self.dev, self.sine_id)
+            if self.const_id is not None:
+                self.const.constant.level = 0
+                self.haptic.SDL_HapticUpdateEffect(self.dev, self.const_id, self.const)
+                self.haptic.SDL_HapticStopEffect(self.dev, self.const_id)
+            for _, eid in self.conditions.values():
+                self.haptic.SDL_HapticStopEffect(self.dev, eid)
+            self.haptic.SDL_HapticStopAll(self.dev)
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def close(self):
+        """**Destroy, do not merely close.** The first version called `stop()` and `SDL_HapticClose`, the
+        process exited, and `SDL_HapticNumEffectsPlaying` still reported 1 -- the wheel stayed pulled to one
+        side, powered, resisting return to centre. An effect outlives the process that created it unless it
+        is destroyed. Registered with `atexit`, so a crash cannot skip this."""
+        self.stop()
+        try:
+            ids = [self.sine_id, self.const_id] + [eid for _, eid in self.conditions.values()]
+            for eid in ids:
+                if eid is not None:
+                    self.haptic.SDL_HapticDestroyEffect(self.dev, eid)
+            if self.haptic and self.dev:
+                self.haptic.SDL_HapticStopAll(self.dev)
+                self.haptic.SDL_HapticClose(self.dev)
+        except Exception:                                       # noqa: BLE001
+            pass
+        self.sine_id = self.const_id = None
+        self.conditions = {}
+        self.dev, self.mode = None, "none"
+
+
+class Mixer:
+    """Telemetry in, a would-be magnitude out. Every channel is optional and ABSENCE IS NOT ZERO: a missing
+    channel contributes nothing and leaves the previous level to decay through the slew limiter, rather than
+    asserting that the car is idling, straight and gripping."""
+
+    def __init__(self, device_class: str, rung: float, armed: bool = False):
+        self.device_class = device_class
+        self.rung = rung
+        self.level = 0.0
+        self.torque = 0.0
+        self.last = time.monotonic()
+        self.frames = 0
+        self.idles = 0
+        self.device_name = None
+        self.caps = {}
+        # **Every one of these is a slider, not a constant.** The owner should never need an editor to change
+        # how their wheel feels, and one person's preference is not a fact about the hardware.
+        self.tune = {
+            "spring": 0.55,     # self-centring weight. The cure for "floaty".
+            "damper": 0.35,     # resistance to being whipped around. Stiffness.
+            "texture": 0.60,    # road and slip rumble
+            "engine": 0.45,     # engine hum, felt at idle as well as at speed
+            "road": 1.00,       # suspension movement
+        }
+        self.out = None                 # set by main() only when --arm was given
+        self.rig = None                 # set by main(); the mixer gates it on seat state
+        # **Force output is opt-in and off.** Everything else in this file runs identically either way, so the
+        # difference between watching telemetry and moving a wheel is one flag rather than a code path nobody
+        # exercised until the day it mattered.
+        self.armed = armed
+
+    def set_rung(self, index) -> float:
+        """Move to a rung BY INDEX on this class's ladder. There is deliberately no way to set an arbitrary
+        magnitude: the ladder is the safety property, and a free value would be a slider with extra steps."""
+        rungs = ladder(self.device_class)
+        if not rungs:
+            return self.rung
+        try:
+            i = int(index)
+        except (TypeError, ValueError):
+            return self.rung
+        i = max(1, min(i, len(rungs)))
+        self.rung = rungs[i - 1]
+        return self.rung
+
+    def describe(self) -> dict:
+        rungs = ladder(self.device_class)
+        try:
+            idx = rungs.index(self.rung) + 1
+        except ValueError:
+            idx = 1
+        out = {
+            "name": self.device_name or "no haptic device",
+            "class": self.device_class,
+            "rung": idx, "rungs": rungs, "armed": self.armed, "haptics": self.caps,
+        }
+        out["tune"] = dict(self.tune)
+        out["caps"] = dict(self.caps)
+        if self.rig is not None:
+            out["rig"] = self.rig.describe()
+        return out
+
+    def feed(self, f: dict) -> float:
+        now = time.monotonic()
+        dt, self.last = now - self.last, now
+
+        if f.get("idle"):
+            # An `idle` frame means NCM has a driver who is NOT in a car. That is also the on-foot signal for
+            # the rig: a wheel must not nudge the walk axis while someone is walking.
+            if self.rig is not None:
+                self.rig.seated = False
+            self.idles += 1
+            self.level = slew(self.level, 0.0, dt)
+            self.torque = slew(self.torque, 0.0, dt)
+            self._emit()
+            return self.level
+
+        # A real frame means a driver in a car, so the rig is live again.
+        if self.rig is not None:
+            self.rig.seated = True
+        self.frames += 1
+
+        # **Rebalanced after the first drive felt like nothing.** Engine RPM used to dominate, and at half
+        # redline that is a fifth of the scale -- so a car being driven hard produced a whisper. Engine is
+        # now a floor of presence rather than the signal, and what the hands should actually notice is the
+        # road: slip and suspension movement, both of which swing far harder while cornering and braking.
+        contributions = []
+        num = lambda key: f[key] if isinstance(f.get(key), (int, float)) else None
+        engine = num("engine")
+        if engine is not None:
+            # **A car should hum at idle.** Engine contribution used to scale straight from the RPM ratio, so
+            # an idling engine at 15% of redline produced almost nothing. A floor means the machine is always
+            # perceptibly running, and the rest still rises with revs.
+            hum = 0.25 + 0.75 * engine
+            contributions.append(1.2 * self.tune["engine"] * hum)
+        for key, weight in (("slipTotal", 2.5), ("slipLong", 1.5), ("slipLat", 2.0)):
+            v = num(key)
+            if v is not None:
+                contributions.append(weight * self.tune["texture"] * min(1.0, abs(v)))
+        for key in ("suspLong", "suspLat"):
+            v = num(key)
+            if v is not None:
+                contributions.append(1.2 * self.tune["road"] * min(1.0, abs(v)))
+        if not contributions:
+            self.level = slew(self.level, 0.0, dt)
+            self._emit()
+            return self.level
+
+        # The rung IS the scale. Channel weights sum to roughly 0..1.8, so the lowest rung (0.05) puts a
+        # fully-loaded car at about a twentieth of the device maximum -- which is where tuning starts.
+        intensity = min(1.0, sum(contributions))
+        target = clamp(self.device_class, intensity * self.rung)
+        self.level = slew(self.level, target, dt)
+
+        # **Self-aligning torque: the thing that makes a wheel feel like a wheel.** Magnitude grows with how
+        # far the wheel is turned and how fast the car is going, and the sign always points BACK TOWARD
+        # CENTRE -- it assists, the way a real car's castor does, and never fights the driver toward lock.
+        steer = num("steering")
+        speed = num("speed") or 0.0
+        if steer is None:
+            self.torque = slew(self.torque, 0.0, dt)
+        else:
+            loading = min(1.0, abs(speed) / 20.0)               # full effect by roughly 70 km/h
+            want = -(1.0 if steer > 0 else -1.0) * min(1.0, abs(steer)) * loading * self.rung
+            self.torque = slew(self.torque, want, dt)
+        self._emit()
+        return self.level
+
+    def _emit(self) -> None:
+        """The single point where a level becomes force. Nothing else in this class touches the device, so
+        'is force being applied?' has exactly one answer to check."""
+        if self.out is not None:
+            self.out.write(self.level, self.torque)
+
+    def silence(self) -> None:
+        self.level = 0.0
+        self.torque = 0.0
+        if self.out is not None:
+            self.out.stop()
+
+    def pulse(self) -> None:
+        """A test pulse is a RAMP UP AND BACK DOWN, never a step.
+
+        The slew limiter exists precisely so nothing arrives as a hammer blow, and a 'test' that bypassed it
+        would be testing something we never ship. So this walks the same limiter the telemetry path uses, at
+        the current rung, and returns to silence."""
+        if self.out is None:
+            return
+        step = 1.0 / 60.0
+        level = 0.0
+        for target in (self.rung, 0.0):
+            for _ in range(90):
+                level = slew(level, target, step)
+                # Texture and a centring push together, so the pulse feels like what driving will feel like
+                # rather than like a buzzer.
+                self.out.write(level, -level)
+                time.sleep(step)
+                if abs(level - target) < 0.002:
+                    break
+        self.out.stop()
+
+
+def serve(conn: socket.socket, addr, mixer: Mixer, port: int) -> None:
+    request = b""
+    while CRLF.encode() * 2 not in request:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return
+        request += chunk
+    lines = request.decode(errors="replace").split(CRLF)
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+
+    if not headers.get("sec-websocket-key"):
+        body = BRIDGE_HTML.encode()
+        head = CRLF.join([
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/html; charset=utf-8",
+            "Content-Length: " + str(len(body)),
+            "Cache-Control: no-store",
+            "Connection: close",
+        ]) + CRLF + CRLF
+        conn.sendall(head.encode() + body)
+        print("[ffb] served bridge page to %s" % (lines[0],), flush=True)
+        return
+
+    conn.sendall((CRLF.join([
+        "HTTP/1.1 101 Switching Protocols",
+        "Upgrade: websocket",
+        "Connection: Upgrade",
+        "Sec-WebSocket-Accept: " + _accept_key(headers["sec-websocket-key"]),
+    ]) + CRLF + CRLF).encode())
+    print("[ffb] telemetry socket open from %s (origin %s)"
+          % (headers.get("user-agent", "?")[:40], headers.get("origin", "?")), flush=True)
+
+    def say(payload: dict) -> None:
+        data = json.dumps(payload).encode()
+        header = bytearray([0x81])
+        if len(data) < 126:
+            header.append(len(data))
+        elif len(data) < (1 << 16):
+            header.append(126)
+            header += struct.pack(">H", len(data))
+        else:
+            header.append(127)
+            header += struct.pack(">Q", len(data))
+        try:
+            conn.sendall(bytes(header) + data)
+        except OSError:
+            pass
+
+    # The panel cannot draw a wheel it has not been told about, and it must not invent one. Announced on
+    # connect and again whenever a setting changes, so the tab is correct without polling.
+    say({"device": mixer.describe()})
+
+    last_print = 0.0
+    while True:
+        frame = _read_frame(conn)
+        if frame is None:
+            break
+        opcode, payload = frame
+        if opcode == 0x8:
+            break
+        if opcode == 0x9:
+            conn.sendall(b"\x8a\x00")
+            continue
+        if opcode != 0x1:
+            continue
+        try:
+            f = json.loads(payload.decode(errors="replace"))
+        except Exception:
+            continue
+        cmd = f.get("cmd")
+        if cmd == "settings":
+            settings = f.get("settings") or {}
+            if settings.get("rung") is not None:
+                rung = mixer.set_rung(settings["rung"])
+                print("[ffb] rung -> %.2f (%s)" % (rung, mixer.device_class), flush=True)
+            if settings.get("armed") is not None:
+                want = bool(settings["armed"])
+                if want and mixer.out is None:
+                    out = Output(mixer.device_class)
+                    why = out.open()
+                    if why:
+                        print("[ffb] arm refused: %s" % why, flush=True)
+                    else:
+                        mixer.out, mixer.armed = out, True
+                        if out.name:
+                            mixer.device_name, mixer.caps = out.name, out.caps
+                        for kind in ("spring", "damper"):
+                            out.set_condition(kind, mixer.tune[kind])
+                        print("[ffb] ARMED from the panel via %s" % out.mode, flush=True)
+                elif not want and mixer.out is not None:
+                    mixer.silence()
+                    mixer.out.close()
+                    mixer.out, mixer.armed = None, False
+                    print("[ffb] disarmed from the panel; wheel released", flush=True)
+            for key in ("spring", "damper", "texture", "engine", "road"):
+                if settings.get(key) is not None:
+                    try:
+                        mixer.tune[key] = max(0.0, min(1.0, float(settings[key])))
+                    except (TypeError, ValueError):
+                        continue
+                    if key in ("spring", "damper") and mixer.out is not None:
+                        mixer.out.set_condition(key, mixer.tune[key])
+                    print("[ffb] %s -> %.2f" % (key, mixer.tune[key]), flush=True)
+            if settings.get("steerDegrees") is not None and mixer.rig is not None:
+                deg = mixer.rig.set_steer_degrees(settings["steerDegrees"])
+                print("[in ] steering -> %.0f deg/side (x%.1f)" % (deg, mixer.rig.scale), flush=True)
+            say({"device": mixer.describe()})
+            continue
+        if cmd == "test":
+            # A test pulse is a RAMP, never a step: the slew limiter exists precisely so nothing arrives as a
+            # hammer blow, and a "test" that bypassed it would be testing something we never ship.
+            print("[ffb] TEST pulse at rung %.2f, ceiling %.2f%s" %
+                  (mixer.rung, CEILING.get(mixer.device_class, CEILING["unknown"]),
+                   "" if mixer.armed else "  (NOT ARMED -- no force applied)"), flush=True)
+            if mixer.armed:
+                threading.Thread(target=mixer.pulse, daemon=True).start()
+            continue
+        if f.get("v") != FRAME_VERSION:
+            # A companion that does not recognise the version refuses the stream rather than guessing at it.
+            print("[ffb] REFUSED frame version %r (expected %d)" % (f.get("v"), FRAME_VERSION), flush=True)
+            continue
+        level = mixer.feed(f)
+        now = time.monotonic()
+        if now - last_print >= 0.5:
+            last_print = now
+            print("[ffb] %s | thr=%-5s brk=%-5s str=%-6s eng=%-5s slip=%-5s -> magnitude %.3f (cap %.2f)"
+                  % ("IDLE " if f.get("idle") else "frame",
+                     f.get("throttle"), f.get("brake"), f.get("steering"),
+                     None if f.get("engine") is None else round(f["engine"], 2),
+                     f.get("slipTotal"), level, CEILING.get(mixer.device_class, CEILING["unknown"])),
+                  flush=True)
+
+    # **The game went away. Stop.** A wheel still buzzing after the client closed is the worst outcome
+    # this program can produce, and a dropped socket is the likeliest way to reach it.
+    mixer.silence()
+    print("[ffb] socket closed after %d frame(s), %d idle -- output silenced" % (mixer.frames, mixer.idles),
+          flush=True)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=38480)
+    ap.add_argument("--class", dest="device_class", default=None, choices=sorted(CEILING),
+                    help="override the detected class. Only ever use this to go LOWER than detection.")
+    ap.add_argument("--rung", type=int, default=1, help="1-based rung on this class's ladder (default: lowest)")
+    ap.add_argument("--no-input", action="store_true",
+                    help="force feedback only; do not present a virtual pad or read the rig.")
+    ap.add_argument("--steer-degrees", type=float, default=45.0,
+                    help="wheel degrees per side mapped to full stick deflection (default 45).")
+    ap.add_argument("--wheel-range", type=float, default=900.0,
+                    help="the wheel's physical lock-to-lock range in degrees (default 900).")
+    ap.add_argument("--selftest", action="store_true",
+                    help="ramp the wheel through the ladder and exit. Proves hardware output without NCM.")
+    ap.add_argument("--profiles", default=None,
+                    help="rig profile JSON. Default: tools/wheel-profiles/default.json")
+    ap.add_argument("--monitor", action="store_true",
+                    help="print live steering and pedal values. Use it to confirm which axis is which.")
+    ap.add_argument("--device", type=int, default=None,
+                    help="force a specific SDL haptic index. Default: try every one until one opens.")
+    ap.add_argument("--arm", action="store_true",
+                    help="permit force output. OFF by default: everything works identically without it.")
+    args = ap.parse_args()
+
+    name, detected, caps = discover()
+    device_class = args.device_class or detected
+    if args.device_class and args.device_class != detected:
+        print("[ffb] class OVERRIDDEN: detected %r, using %r" % (detected, args.device_class), flush=True)
+    args.device_class = device_class
+
+    rungs = ladder(args.device_class)
+    if not rungs:
+        print("no ladder for class %r" % args.device_class)
+        return 2
+    idx = max(1, min(args.rung, len(rungs)))
+    rung = rungs[idx - 1]
+
+    print("[ffb] device class : %s" % args.device_class, flush=True)
+    print("[ffb] ceiling      : %.2f of device maximum" % CEILING[args.device_class], flush=True)
+    print("[ffb] ladder       : %s" % ", ".join("%.2f" % r for r in rungs), flush=True)
+    print("[ffb] starting rung: %d of %d (%.2f)  <-- start at 1 and stop when a rung adds nothing"
+          % (idx, len(rungs), rung), flush=True)
+    if args.device_class in ("unknown", "direct_drive"):
+        print("[ffb] NOTE: this class is untested by the authors. The ceiling is deliberately low and is a"
+              " starting point for testing, not a tuned value.", flush=True)
+
+    # Input first, and independent of everything else: steering and pedals must work whether or not NCM is
+    # running, whether or not force feedback armed, and whether or not the telemetry bridge ever connects.
+    rig = None
+    if not args.no_input:
+        rig = Input(steer_degrees=args.steer_degrees, wheel_range=args.wheel_range,
+                    profile_path=args.profiles)
+        why_in = rig.open()
+        if why_in:
+            print("[in ] INPUT UNAVAILABLE: %s" % why_in, flush=True)
+            rig = None
+        else:
+            rig.start()
+
+    mixer = Mixer(args.device_class, rung, armed=args.arm)
+    mixer.rig = rig
+
+    if args.selftest:
+        out = Output(args.device_class)
+        out.index = args.device
+        why = out.open()
+        if why:
+            print("[ffb] SELFTEST cannot arm: %s" % why, flush=True)
+            return 2
+        print("[ffb] selftest via %s effect. Ceiling %.2f." % (out.mode, CEILING[args.device_class]),
+              flush=True)
+        try:
+            for step in ladder(args.device_class):
+                print("[ffb]   texture %.2f + centring torque, 2s" % step, flush=True)
+                out.write(step, -step)
+                time.sleep(2.0)
+            out.write(0.0, 0.0)
+        finally:
+            # The first version left the wheel powered and pulled to one side. Destroy, do not merely close.
+            out.close()
+        print("[ffb] selftest done; wheel released", flush=True)
+        if rig is not None:
+            rig.stop()
+        return 0
+    mixer.device_name, mixer.caps = name, caps
+    if args.arm:
+        out = Output(args.device_class)
+        out.index = args.device
+        why = out.open()
+        if why:
+            print("[ffb] ARM FAILED: %s" % why, flush=True)
+            if "Resetting device" in why or "HapticOpen" in why:
+                # Observed 2026-09-24: SDL can NAME the G29 but cannot open its haptics while Cyberpunk is
+                # already running. DirectInput force feedback is an exclusive acquisition and the first
+                # process to take it keeps it, so the order of startup decides who gets the wheel.
+                print("[ffb] SDL can see the device but cannot acquire it. Force feedback is an EXCLUSIVE",
+                      flush=True)
+                print("[ffb] acquisition -- whichever process takes it first keeps it. Start this companion",
+                      flush=True)
+                print("[ffb] BEFORE the game (build-ffb-companion.ps1 -InstallStartup does that for you).",
+                      flush=True)
+                print("[ffb] Also check that Logitech G HUB is running, which Logitech wheels need for SDL",
+                      flush=True)
+                print("[ffb] haptics to be exposed at all.", flush=True)
+            print("[ffb] continuing with telemetry only.", flush=True)
+            mixer.armed = False
+        else:
+            mixer.out = out
+            for kind in ("spring", "damper"):
+                out.set_condition(kind, mixer.tune[kind])
+            # Output has just opened the device, so it knows the name and capabilities first-hand. Use those
+            # rather than the earlier open/close probe -- one open, one source of truth.
+            if out.name:
+                mixer.device_name, mixer.caps = out.name, out.caps
+            print("[ffb] armed via %s effect" % out.mode, flush=True)
+    print("[ffb] device       : %s" % (name or "none detected"), flush=True)
+    print("[ffb] force output : %s" % ("ARMED" if args.arm else "disarmed (telemetry only)"), flush=True)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", args.port))
+    srv.listen(4)
+    print("[ffb] listening on http://127.0.0.1:%d/bridge.html  --  now run /ncm.ffb on in game"
+          % args.port, flush=True)
+    if args.monitor and rig is not None:
+        def watch():
+            while True:
+                time.sleep(0.25)
+                d = rig.last
+                if d:
+                    print("[in ] raw=%+.3f -> steer=%+.3f | throttle=%.2f | brake=%.2f"
+                          % (d.get("raw", 0), d.get("steer", 0), d.get("throttle", 0), d.get("brake", 0)),
+                          flush=True)
+        threading.Thread(target=watch, daemon=True).start()
+
+    try:
+        while True:
+            conn, addr = srv.accept()
+            threading.Thread(target=serve, args=(conn, addr, mixer, args.port), daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Unconditional. Ctrl-C, an unhandled exception, a closed window -- every one of them ends with the
+        # wheel quiet, because the alternative is a device left oscillating by a process that no longer runs.
+        mixer.silence()
+        if mixer.out is not None:
+            mixer.out.close()
+        if rig is not None:
+            rig.stop()
+        srv.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

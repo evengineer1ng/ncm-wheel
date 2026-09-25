@@ -1,0 +1,143 @@
+{
+  "_comment": [
+    "Rig profiles for NCM wheel support. DATA, not code -- nothing about anyone's hardware belongs in the",
+    "program. Every entry is optional; a rig with no matching profile still steers, because roles are",
+    "detected by shape (see `_detection`). A profile only adds what detection cannot know: which button on an",
+    "unlabelled rim is `a`.",
+    "",
+    "Matching is by case-insensitive substring against the SDL device name, most specific first. Standard",
+    "gamepads need no entry at all -- SDL's GameController database already maps them.",
+    "",
+    "To add your own rim: run `ncm-wheel.py --bind`, press each control when asked, and it writes a profile",
+    "here. Nothing needs editing by hand."
+  ],
+  "_detection": {
+    "steering": "an axis that rests near centre and travels both ways",
+    "pedals": "axes that rest at one END of travel",
+    "rim": "many buttons, no usable axes",
+    "gamepad": "anything SDL recognises as a game controller"
+  },
+  "defaults": {
+    "steer_degrees": 45,
+    "wheel_range_degrees": 900,
+    "steer_deadzone": 0.015,
+    "steer_curve": 1.3,
+    "pedal_deadzone": 0.02,
+    "gamepad_deadzone": 0.08
+  },
+  "profiles": [
+    {
+      "name": "Evenracing rim",
+      "match": [
+        "evenracing",
+        "axis 28 button device"
+      ],
+      "role": "rim",
+      "buttons": {
+        "0": "x",
+        "1": "y",
+        "2": "b",
+        "3": "dpad_down",
+        "4": "dpad_left",
+        "5": "dpad_up",
+        "6": "dpad_right",
+        "7": "back",
+        "8": "start",
+        "9": "ls",
+        "10": "rs",
+        "11": "lb",
+        "12": "rb",
+        "20": "home",
+        "24": "a",
+        "27": "x"
+      },
+      "ignore_buttons": [
+        14,
+        16
+      ],
+      "ignore_axes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "note": "Idle diagnostic: axes sat at -32768 and buttons 14/16 fired intermittently."
+    },
+    {
+      "name": "Sim Pedals",
+      "match": [
+        "sim pedals"
+      ],
+      "role": "pedals",
+      "axes": {
+        "throttle": 0,
+        "brake": 2,
+        "clutch": 1
+      },
+      "released": -32768
+    },
+    {
+      "name": "Logitech G29 (USB interface)",
+      "match": [
+        "g29"
+      ],
+      "role": "steering",
+      "axes": {
+        "steer": 0
+      },
+      "device_class": "gear"
+    },
+    {
+      "name": "Logitech G920 / G923 / G27",
+      "match": [
+        "g920",
+        "g923",
+        "g27"
+      ],
+      "role": "steering",
+      "axes": {
+        "steer": 0
+      },
+      "device_class": "gear"
+    },
+    {
+      "name": "Thrustmaster belt drive",
+      "match": [
+        "t300",
+        "t150",
+        "tmx",
+        "t500",
+        "thrustmaster"
+      ],
+      "role": "steering",
+      "axes": {
+        "steer": 0
+      },
+      "device_class": "belt"
+    },
+    {
+      "name": "Direct drive bases",
+      "match": [
+        "moza",
+        "simucube",
+        "simagic",
+        "fanatec dd",
+        "podium",
+        "csl dd",
+        "asetek",
+        "cammus",
+        "vrs"
+      ],
+      "role": "steering",
+      "axes": {
+        "steer": 0
+      },
+      "device_class": "direct_drive",
+      "note": "Untested by the authors. driver.feedback caps this class hard on purpose."
+    }
+  ]
+}
