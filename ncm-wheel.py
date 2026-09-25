@@ -43,6 +43,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -456,9 +457,9 @@ class Input:
             # stack trace for a driver they have never heard of.
             detail = str(exc)
             if "vgamepad" in detail or "ViGEm" in detail or "client" in detail.lower():
-                return ("ViGEmBus not found -- wheel and pedals will not drive the car without it. "
-                        "Install it from https://github.com/nefarius/ViGEmBus/releases and restart. "
-                        "(Force feedback does not need it and will still work.)")
+                return ("ViGEmBus is not installed, so the wheel and pedals cannot drive the car. "
+                        "Close and reopen this program and it will offer to install it for you. "
+                        "(Force feedback does not need it and works either way.)")
             return "input unavailable: %s" % detail
         self.sdl, self.vg = sdl2, vg
         try:
@@ -1304,6 +1305,180 @@ def serve(conn: socket.socket, addr, mixer: Mixer, port: int) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# ViGEmBus: detect it, and offer to install it.
+# --------------------------------------------------------------------------------------------------
+#
+# ViGEmBus is a driver by Nefarius Software Solutions that lets a program present a virtual game controller.
+# Cyberpunk has no native wheel support, so the rig has to arrive as a controller -- without this driver the
+# wheel and pedals do not drive the car at all.
+#
+# **This code downloads and runs a third-party installer, so it does so carefully**: nothing happens without
+# an explicit click, the exact URL is shown before the download, and the file's Authenticode signature is
+# checked and the signer's name displayed before it is executed. A download that is not validly signed is
+# refused outright rather than run with a warning.
+
+VIGEM_RELEASES = "https://github.com/nefarius/ViGEmBus/releases"
+VIGEM_API = "https://api.github.com/repos/nefarius/ViGEmBus/releases/latest"
+
+
+def vigem_present():
+    """Is the driver installed? Asked of Windows, not inferred from an exception."""
+    if os.name != "nt":
+        return False
+    try:
+        out = subprocess.run(["sc", "query", "ViGEmBus"], capture_output=True, text=True, timeout=10)
+        if "RUNNING" in out.stdout or "STOPPED" in out.stdout:
+            return True
+    except Exception:                                           # noqa: BLE001 - detection must never throw
+        pass
+    # A service query can fail for reasons unrelated to the driver, so fall back to asking the library
+    # whether it can actually create a pad -- which is the thing we care about.
+    try:
+        import vgamepad as vg
+        pad = vg.VX360Gamepad()
+        del pad
+        return True
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
+def vigem_latest_installer():
+    """(url, filename) of the latest x64 installer, or (None, why)."""
+    import json as _json
+    import urllib.request
+    try:
+        req = urllib.request.Request(VIGEM_API, headers={"User-Agent": "ncm-wheel"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = _json.loads(r.read().decode("utf-8", "replace"))
+        for asset in data.get("assets", []):
+            name = asset.get("name", "")
+            if name.lower().endswith(".exe"):
+                return asset.get("browser_download_url"), name
+        return None, "no installer in the latest release"
+    except Exception as exc:                                    # noqa: BLE001 - offline is an ordinary case
+        return None, str(exc)
+
+
+def verify_signature(path):
+    """(ok, description). **A download that is not validly signed is never run.**"""
+    try:
+        ps = ("$s = Get-AuthenticodeSignature -LiteralPath '%s'; "
+              "Write-Output $s.Status; Write-Output $s.SignerCertificate.Subject" % path)
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=60)
+        lines = [l.strip() for l in out.stdout.splitlines() if l.strip()]
+        if not lines:
+            return False, "no signature information"
+        status = lines[0]
+        subject = lines[1] if len(lines) > 1 else "(unknown signer)"
+        cn = subject
+        for part in subject.split(","):
+            if part.strip().upper().startswith("CN="):
+                cn = part.strip()[3:]
+                break
+        return (status == "Valid"), "%s -- signed by %s" % (status, cn)
+    except Exception as exc:                                    # noqa: BLE001
+        return False, "could not check the signature: %s" % exc
+
+
+class VigemDialog(object):
+    """Missing-driver consent. Blocks until the user chooses; every choice is legitimate."""
+
+    def __init__(self, parent_tk):
+        self.tk = parent_tk
+        self.result = None
+
+    def show(self):
+        tk = self.tk
+        bg, fg, dim = "#0d1117", "#d8e0e8", "#8b98a5"
+        win = tk.Toplevel()
+        win.title("ViGEmBus is required")
+        win.configure(bg=bg)
+        win.geometry("560x340")
+        win.grab_set()
+
+        tk.Label(win, text="ONE THING IS MISSING", bg=bg, fg="#f0a04b",
+                 font=("Consolas", 12, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        body = ("Your wheel and pedals cannot drive the car without ViGEmBus.\n\n"
+                "Cyberpunk has no built-in wheel support, so the rig has to be presented to it as a game "
+                "controller. ViGEmBus is the free, open-source driver that makes that possible. It is made "
+                "by Nefarius Software Solutions and is widely used.\n\n"
+                "Force feedback does not need it and will work either way.")
+        tk.Label(win, text=body, bg=bg, fg=fg, font=("Consolas", 9), justify="left",
+                 wraplength=520, anchor="w").pack(anchor="w", padx=16)
+        tk.Label(win, text=VIGEM_RELEASES, bg=bg, fg=dim, font=("Consolas", 8),
+                 anchor="w").pack(anchor="w", padx=16, pady=(10, 0))
+
+        self.status = tk.Label(win, text="", bg=bg, fg=dim, font=("Consolas", 8),
+                               justify="left", wraplength=520, anchor="w")
+        self.status.pack(anchor="w", padx=16, pady=(8, 0))
+
+        bar = tk.Frame(win, bg=bg)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+
+        def choose(value):
+            self.result = value
+            if value == "install":
+                self.install(win)
+            else:
+                win.destroy()
+
+        mk = lambda text, val, accent: tk.Button(
+            bar, text=text, command=lambda: choose(val), relief="flat",
+            bg=("#1f6feb" if accent else "#1c2530"), fg="#ffffff" if accent else fg,
+            font=("Consolas", 9), padx=12, pady=6)
+        mk("Download and install it for me", "install", True).pack(side="left")
+        mk("Open the page, I'll do it", "open", False).pack(side="left", padx=8)
+        mk("Continue without", "skip", False).pack(side="left")
+
+        win.protocol("WM_DELETE_WINDOW", lambda: choose("skip"))
+        win.wait_window()
+        if self.result == "open":
+            import webbrowser
+            webbrowser.open(VIGEM_RELEASES)
+        return self.result
+
+    def install(self, win):
+        """Fetch, verify, then hand to the official installer -- which will raise its own UAC prompt."""
+        import tempfile
+        import urllib.request
+
+        def say(text):
+            self.status.configure(text=text)
+            win.update_idletasks()
+            print("[vig] " + text, flush=True)
+
+        say("Finding the latest release...")
+        url, name = vigem_latest_installer()
+        if not url:
+            say("Could not reach GitHub (%s). Use the button above to open the page instead." % name)
+            return
+        say("Downloading %s" % name)
+        try:
+            target = os.path.join(tempfile.gettempdir(), name)
+            req = urllib.request.Request(url, headers={"User-Agent": "ncm-wheel"})
+            with urllib.request.urlopen(req, timeout=120) as r, io.open(target, "wb") as fh:
+                fh.write(r.read())
+        except Exception as exc:                                # noqa: BLE001
+            say("Download failed (%s). Use the button above to open the page instead." % exc)
+            return
+
+        say("Checking the signature...")
+        ok, detail = verify_signature(target)
+        if not ok:
+            # Refused, not warned. An unsigned or tampered installer is not something to run on a user's
+            # machine on our say-so.
+            say("REFUSED: %s. Nothing was run. Please download it yourself from the page above." % detail)
+            return
+        say("%s. Starting the installer -- Windows will ask for permission." % detail)
+        try:
+            subprocess.Popen([target], shell=False)
+            say("Installer started. When it finishes, close and reopen NCM Wheel Support.")
+        except Exception as exc:                                # noqa: BLE001
+            say("Could not start the installer (%s). It is saved at %s" % (exc, target))
+
+
+# --------------------------------------------------------------------------------------------------
 # The window.
 # --------------------------------------------------------------------------------------------------
 #
@@ -1495,6 +1670,24 @@ def main() -> int:
     if args.device_class in ("unknown", "direct_drive"):
         print("[ffb] NOTE: this class is untested by the authors. The ceiling is deliberately low and is a"
               " starting point for testing, not a tuned value.", flush=True)
+
+    # **Before touching input**, so a missing driver arrives as an offer of help rather than as a failure
+    # the user has to interpret. Headless skips it: there is nobody to ask.
+    if not args.no_input and not args.headless and not args.selftest and not vigem_present():
+        print("[vig] ViGEmBus not detected", flush=True)
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            choice = VigemDialog(tk).show()
+            root.destroy()
+            print("[vig] user chose: %s" % choice, flush=True)
+            if choice == "install":
+                # The installer runs on its own schedule and needs a restart to take effect, so there is
+                # nothing useful to wait for here.
+                problem("Finish the ViGEmBus installer, then close and reopen NCM Wheel Support.")
+        except Exception as exc:                                # noqa: BLE001 - no Tk, no dialog, carry on
+            print("[vig] could not show the dialog (%s)" % exc, flush=True)
 
     # Input first, and independent of everything else: steering and pedals must work whether or not NCM is
     # running, whether or not force feedback armed, and whether or not the telemetry bridge ever connects.

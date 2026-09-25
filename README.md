@@ -31,16 +31,14 @@ enumerates your hardware through it, decides when the rig is live, tunes the fee
 
 ## Install
 
-**You need [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) first.** It is the virtual controller
-driver that lets your wheel and pedals actually drive the car — Cyberpunk has no native wheel support, so
-the rig has to be presented to it as a controller. Install it once and forget it.
-
-(Force feedback alone does not need ViGEmBus. If it is missing you will still get FFB, and no steering.)
-
-1. Install ViGEmBus.
-2. Download `NCM Wheel Support.exe` from [Releases](../../releases), and check it against `SHA256SUMS.txt`.
-3. Run it. A small status window opens: it lists the hardware it found, says whether the game has
+1. Download `NCM Wheel Support.exe` from [Releases](../../releases), and check it against `SHA256SUMS.txt`.
+2. Run it. A small status window opens: it lists the hardware it found, says whether the game has
    connected, and shows anything that went wrong. Minimise it and leave it running.
+3. **If ViGEmBus is missing it will offer to install it for you.** That is the driver that lets your wheel
+   and pedals drive the car — Cyberpunk has no native wheel support, so the rig has to arrive as a game
+   controller. You can let the program fetch it, open the page and do it yourself, or carry on without.
+   It shows the download URL first, and refuses to run the installer unless it is validly signed by
+   Nefarius Software Solutions. Force feedback does not need it and works either way.
 4. Join an NCM server, open the NCM panel (`F6`) and pick **WHEEL/PEDALS**.
 5. Press **ARM FORCE OUTPUT**, then start at the **lowest strength** and work up.
 
