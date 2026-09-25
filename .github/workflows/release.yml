@@ -47,6 +47,7 @@ jobs:
             --collect-all sdl2dll `
             --hidden-import sdl2 `
             --hidden-import vgamepad `
+            --hidden-import tkinter `
             ncm-wheel.py
           if (-not (Test-Path "dist\NCM Wheel Support.exe")) { throw "build produced no exe" }
 

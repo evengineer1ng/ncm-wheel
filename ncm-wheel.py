@@ -20,7 +20,7 @@ This mirrors `ncm/core/driver/feedback.lua`, which is the authority and is cover
 in step; if they ever disagree, the Lua is right.
 
 **SDL haptic magnitude is normalised, and normalised is not equal.** A 0.5 constant force is about a
-newton-metre on a belt-drive G29 and about ten on a 20 Nm direct-drive base. The same number is a nudge on one
+newton-metre on a gear-drive G29 and about ten on a 20 Nm direct-drive base. The same number is a nudge on one
 device and a wrist injury on another. So:
 
   * ceilings are per device CLASS, and the classes nobody here can test are held far below the ones we can;
@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import collections
 import io
 import hashlib
 import json
@@ -47,6 +48,49 @@ import threading
 import time
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# Everything this program prints, kept so the window can show it and the clipboard button can carry it.
+# A packaged build has no console at all, so without this the output would go nowhere -- which is exactly
+# how a tester ends up being asked to find a log file.
+LOG = collections.deque(maxlen=400)
+STATE = {
+    "port": None, "listening": False, "connected": False, "armed": False,
+    "wheel": None, "pedals": None, "rim": None, "gamepads": [],
+    "device": None, "device_class": None, "rung": None, "problems": [],
+    "frames": 0, "version": "0.1.0",
+}
+
+
+class _Tee(object):
+    """Write to the real stdout when there is one, and always into LOG."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        for line in str(text).splitlines():
+            if line.strip():
+                LOG.append(line)
+        if self.stream is not None:
+            try:
+                self.stream.write(text)
+            except Exception:                                   # noqa: BLE001 - a dead console must not kill us
+                self.stream = None
+        return len(text)
+
+    def flush(self):
+        if self.stream is not None:
+            try:
+                self.stream.flush()
+            except Exception:                                   # noqa: BLE001
+                self.stream = None
+
+
+def problem(text):
+    """Something the user has to act on. Kept separate from the log so it can be shown, not buried."""
+    if text not in STATE["problems"]:
+        STATE["problems"].append(text)
+    print("[!!!] " + text, flush=True)
 CRLF = chr(13) + chr(10)
 
 FRAME_VERSION = 1
@@ -1145,6 +1189,7 @@ def serve(conn: socket.socket, addr, mixer: Mixer, port: int) -> None:
         "Connection: Upgrade",
         "Sec-WebSocket-Accept: " + _accept_key(headers["sec-websocket-key"]),
     ]) + CRLF + CRLF).encode())
+    STATE["connected"] = True
     print("[ffb] telemetry socket open from %s (origin %s)"
           % (headers.get("user-agent", "?")[:40], headers.get("origin", "?")), flush=True)
 
@@ -1204,11 +1249,13 @@ def serve(conn: socket.socket, addr, mixer: Mixer, port: int) -> None:
                             mixer.device_name, mixer.caps = out.name, out.caps
                         for kind in ("spring", "damper"):
                             out.set_condition(kind, mixer.tune[kind])
+                        STATE["armed"], STATE["device"] = True, out.name
                         print("[ffb] ARMED from the panel via %s" % out.mode, flush=True)
                 elif not want and mixer.out is not None:
                     mixer.silence()
                     mixer.out.close()
                     mixer.out, mixer.armed = None, False
+                    STATE["armed"] = False
                     print("[ffb] disarmed from the panel; wheel released", flush=True)
             for key in ("spring", "damper", "texture", "engine", "road"):
                 if settings.get(key) is not None:
@@ -1251,11 +1298,155 @@ def serve(conn: socket.socket, addr, mixer: Mixer, port: int) -> None:
     # **The game went away. Stop.** A wheel still buzzing after the client closed is the worst outcome
     # this program can produce, and a dropped socket is the likeliest way to reach it.
     mixer.silence()
+    STATE["connected"] = False
     print("[ffb] socket closed after %d frame(s), %d idle -- output silenced" % (mixer.frames, mixer.idles),
           flush=True)
 
 
+# --------------------------------------------------------------------------------------------------
+# The window.
+# --------------------------------------------------------------------------------------------------
+#
+# Tkinter, because it is in the standard library: no extra dependency, nothing else to install, and
+# PyInstaller bundles it without special handling. It is a status display and not a control panel -- every
+# setting lives in the game, where the driver already is.
+
+
+class StatusWindow(object):
+    """A small always-honest readout: what was found, what is wrong, and a button that copies it all."""
+
+    ROWS = (
+        ("Companion", "listening"),
+        ("Game", "connected"),
+        ("Force output", "armed"),
+        ("Steering", "wheel"),
+        ("Pedals", "pedals"),
+        ("Buttons", "rim"),
+        ("Controller", "gamepads"),
+    )
+
+    def __init__(self, on_close):
+        import tkinter as tk
+        from tkinter import scrolledtext
+        self.tk, self.on_close = tk, on_close
+        self.root = tk.Tk()
+        self.root.title("NCM Wheel Support")
+        self.root.geometry("560x470")
+        self.root.minsize(460, 380)
+        bg, fg, dim = "#0d1117", "#d8e0e8", "#8b98a5"
+        self.root.configure(bg=bg)
+
+        head = tk.Frame(self.root, bg=bg)
+        head.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(head, text="NCM WHEEL SUPPORT", bg=bg, fg=fg,
+                 font=("Consolas", 13, "bold")).pack(side="left")
+        tk.Label(head, text="v" + STATE["version"], bg=bg, fg=dim,
+                 font=("Consolas", 9)).pack(side="left", padx=(8, 0))
+
+        grid = tk.Frame(self.root, bg=bg)
+        grid.pack(fill="x", padx=14)
+        self.values = {}
+        for i, (label, key) in enumerate(self.ROWS):
+            tk.Label(grid, text=label.upper(), bg=bg, fg=dim, font=("Consolas", 9),
+                     anchor="w", width=13).grid(row=i, column=0, sticky="w", pady=1)
+            v = tk.Label(grid, text="-", bg=bg, fg=fg, font=("Consolas", 9), anchor="w",
+                         justify="left", wraplength=400)
+            v.grid(row=i, column=1, sticky="w", pady=1)
+            self.values[key] = v
+
+        # Problems get their own block and their own colour, because they are the only thing here that
+        # requires the reader to do something.
+        self.problem = tk.Label(self.root, text="", bg=bg, fg="#f0a04b", font=("Consolas", 9),
+                                anchor="w", justify="left", wraplength=520)
+        self.problem.pack(fill="x", padx=14, pady=(8, 0))
+
+        self.text = scrolledtext.ScrolledText(self.root, height=10, bg="#11161d", fg=dim,
+                                              font=("Consolas", 8), relief="flat", wrap="word")
+        self.text.pack(fill="both", expand=True, padx=14, pady=10)
+        self.text.configure(state="disabled")
+
+        bar = tk.Frame(self.root, bg=bg)
+        bar.pack(fill="x", padx=14, pady=(0, 12))
+        tk.Button(bar, text="Copy diagnostics", command=self.copy,
+                  bg="#1c2530", fg=fg, relief="flat", font=("Consolas", 9),
+                  padx=10, pady=4).pack(side="left")
+        self.copied = tk.Label(bar, text="", bg=bg, fg="#5dd39e", font=("Consolas", 9))
+        self.copied.pack(side="left", padx=10)
+        tk.Label(bar, text="Settings live in the game: F6 -> WHEEL/PEDALS", bg=bg, fg=dim,
+                 font=("Consolas", 8)).pack(side="right")
+
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        self._seen = 0
+        self._tick()
+
+    # ------------------------------------------------------------------
+    def diagnostics(self):
+        """Everything someone would otherwise be asked to dig out of a log."""
+        lines = ["NCM Wheel Support v%s -- diagnostics" % STATE["version"], ""]
+        for label, key in self.ROWS:
+            lines.append("%-13s %s" % (label + ":", self._value(key)))
+        lines.append("%-13s %s" % ("Wheel class:", STATE.get("device_class") or "-"))
+        lines.append("%-13s %s" % ("Strength:", STATE.get("rung") or "-"))
+        lines.append("%-13s %s" % ("Frames:", STATE.get("frames")))
+        if STATE["problems"]:
+            lines += ["", "PROBLEMS:"] + ["  - " + p for p in STATE["problems"]]
+        lines += ["", "LOG:"] + list(LOG)
+        return "\n".join(lines)
+
+    def copy(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.diagnostics())
+            self.copied.configure(text="copied -- paste it to whoever is helping")
+            self.root.after(4000, lambda: self.copied.configure(text=""))
+        except Exception:                                       # noqa: BLE001
+            self.copied.configure(text="could not reach the clipboard")
+
+    def _value(self, key):
+        if key == "listening":
+            return ("listening on port %s" % STATE["port"]) if STATE["listening"] else "not started"
+        if key == "connected":
+            return "connected" if STATE["connected"] else "waiting for the game"
+        if key == "armed":
+            if not STATE["armed"]:
+                return "off -- arm it in game (F6 -> WHEEL/PEDALS)"
+            return "ON  -- %s" % (STATE.get("device") or "wheel")
+        if key == "gamepads":
+            return ", ".join(STATE["gamepads"]) if STATE["gamepads"] else "none"
+        return STATE.get(key) or "not found"
+
+    def _tick(self):
+        for _, key in self.ROWS:
+            text = self._value(key)
+            if self.values[key].cget("text") != text:
+                self.values[key].configure(text=text)
+        self.problem.configure(
+            text=("\n".join("! " + p for p in STATE["problems"])) if STATE["problems"] else "")
+        if len(LOG) != self._seen:
+            self._seen = len(LOG)
+            self.text.configure(state="normal")
+            self.text.delete("1.0", "end")
+            self.text.insert("end", "\n".join(list(LOG)[-200:]))
+            self.text.see("end")
+            self.text.configure(state="disabled")
+        self.root.after(400, self._tick)
+
+    def _close(self):
+        try:
+            self.on_close()
+        finally:
+            self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
 def main() -> int:
+    # Before anything prints. A packaged build has no console, so without the tee the startup lines -- the
+    # ones that say which devices were found -- would simply vanish.
+    sys.stdout = _Tee(sys.stdout)
+    sys.stderr = _Tee(sys.stderr)
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=38480)
     ap.add_argument("--class", dest="device_class", default=None, choices=sorted(CEILING),
@@ -1267,6 +1458,8 @@ def main() -> int:
                     help="wheel degrees per side mapped to full stick deflection (default 45).")
     ap.add_argument("--wheel-range", type=float, default=900.0,
                     help="the wheel's physical lock-to-lock range in degrees (default 900).")
+    ap.add_argument("--headless", action="store_true",
+                    help="no window. The old behaviour; CI and anyone who wants it invisible.")
     ap.add_argument("--selftest", action="store_true",
                     help="ramp the wheel through the ladder and exit. Proves hardware output without NCM.")
     ap.add_argument("--profiles", default=None,
@@ -1292,9 +1485,11 @@ def main() -> int:
     idx = max(1, min(args.rung, len(rungs)))
     rung = rungs[idx - 1]
 
+    STATE["device_class"] = args.device_class
     print("[ffb] device class : %s" % args.device_class, flush=True)
     print("[ffb] ceiling      : %.2f of device maximum" % CEILING[args.device_class], flush=True)
     print("[ffb] ladder       : %s" % ", ".join("%.2f" % r for r in rungs), flush=True)
+    STATE["rung"] = "%.2f (rung %d of %d)" % (rung, idx, len(rungs))
     print("[ffb] starting rung: %d of %d (%.2f)  <-- start at 1 and stop when a rung adds nothing"
           % (idx, len(rungs), rung), flush=True)
     if args.device_class in ("unknown", "direct_drive"):
@@ -1309,11 +1504,19 @@ def main() -> int:
                     profile_path=args.profiles)
         why_in = rig.open()
         if why_in:
-            print("[in ] INPUT UNAVAILABLE: %s" % why_in, flush=True)
+            problem(why_in)
             print("[in ] Force feedback is unaffected; steering and pedals are not available.", flush=True)
             rig = None
         else:
             rig.start()
+            STATE["wheel"] = rig.steering.name if rig.steering else None
+            STATE["pedals"] = rig.pedals.name if rig.pedals else None
+            STATE["rim"] = rig.rim.name if rig.rim else None
+            STATE["gamepads"] = [n for n, _ in rig.controllers]
+            if rig.steering is None:
+                problem("No steering device found. Is the wheel plugged in and powered?")
+            if rig.pedals is None:
+                problem("No pedals found. Steering will work; throttle and brake will not.")
 
     mixer = Mixer(args.device_class, rung, armed=args.arm)
     mixer.rig = rig
@@ -1346,7 +1549,7 @@ def main() -> int:
         out.index = args.device
         why = out.open()
         if why:
-            print("[ffb] ARM FAILED: %s" % why, flush=True)
+            problem("Force feedback could not start: %s" % why)
             if "Resetting device" in why or "HapticOpen" in why:
                 # Observed 2026-09-24: SDL can NAME the G29 but cannot open its haptics while Cyberpunk is
                 # already running. DirectInput force feedback is an exclusive acquisition and the first
@@ -1370,6 +1573,8 @@ def main() -> int:
             # rather than the earlier open/close probe -- one open, one source of truth.
             if out.name:
                 mixer.device_name, mixer.caps = out.name, out.caps
+            STATE["armed"] = True
+            STATE["device"] = out.name
             print("[ffb] armed via %s effect" % out.mode, flush=True)
     print("[ffb] device       : %s" % (name or "none detected"), flush=True)
     print("[ffb] force output : %s" % ("ARMED" if args.arm else "disarmed (telemetry only)"), flush=True)
@@ -1390,21 +1595,59 @@ def main() -> int:
                           flush=True)
         threading.Thread(target=watch, daemon=True).start()
 
-    try:
-        while True:
-            conn, addr = srv.accept()
-            threading.Thread(target=serve, args=(conn, addr, mixer, args.port), daemon=True).start()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # Unconditional. Ctrl-C, an unhandled exception, a closed window -- every one of them ends with the
+    STATE["port"], STATE["listening"] = args.port, True
+
+    def shutdown():
+        # Unconditional. Ctrl-C, a closed window, an unhandled exception -- every one of them ends with the
         # wheel quiet, because the alternative is a device left oscillating by a process that no longer runs.
         mixer.silence()
         if mixer.out is not None:
             mixer.out.close()
         if rig is not None:
             rig.stop()
-        srv.close()
+        try:
+            srv.close()
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def accept_loop():
+        while True:
+            try:
+                conn, addr = srv.accept()
+            except OSError:
+                return                                          # socket closed on the way out
+            threading.Thread(target=serve, args=(conn, addr, mixer, args.port), daemon=True).start()
+
+    if args.headless:
+        try:
+            accept_loop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            shutdown()
+        return 0
+
+    # The window owns the main thread; the server runs behind it. Closing the window shuts everything down
+    # through the same path as Ctrl-C, so there is one teardown rather than two.
+    threading.Thread(target=accept_loop, daemon=True).start()
+    try:
+        window = StatusWindow(shutdown)
+    except Exception as exc:                                    # noqa: BLE001 - no display, no Tk, no matter
+        print("[ui ] no window (%s); running headless" % exc, flush=True)
+        try:
+            accept_loop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            shutdown()
+        return 0
+
+    def refresh_frames():
+        STATE["frames"] = mixer.frames
+        window.root.after(1000, refresh_frames)
+
+    window.root.after(1000, refresh_frames)
+    window.run()
     return 0
 
 

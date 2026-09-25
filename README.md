@@ -39,12 +39,18 @@ the rig has to be presented to it as a controller. Install it once and forget it
 
 1. Install ViGEmBus.
 2. Download `NCM Wheel Support.exe` from [Releases](../../releases), and check it against `SHA256SUMS.txt`.
-3. Run it. There is no window — that is expected.
+3. Run it. A small status window opens: it lists the hardware it found, says whether the game has
+   connected, and shows anything that went wrong. Minimise it and leave it running.
 4. Join an NCM server, open the NCM panel (`F6`) and pick **WHEEL/PEDALS**.
 5. Press **ARM FORCE OUTPUT**, then start at the **lowest strength** and work up.
 
+**If something is wrong, the window says so** — no wheel found, ViGEmBus missing, game not connected — and
+**Copy diagnostics** puts the whole picture on your clipboard to paste to whoever is helping. You should
+never have to go looking for a log file.
+
 To have it start with Windows, run `build.ps1 -InstallStartup`, or drop a shortcut to the exe in your
 Startup folder yourself. It is an ordinary shortcut, not a service or a registry entry, so you can delete it.
+`--headless` runs it with no window if you would rather not see it.
 
 **Logitech wheels need G HUB installed and running** for SDL to see their force feedback at all.
 
@@ -63,7 +69,7 @@ Build your own exe with `.\build.ps1`.
 Read this before turning force output up, especially on a direct drive base.
 
 **SDL haptic magnitude is normalised, and normalised is not equal.** A `0.5` constant force is roughly a
-newton-metre on a belt-drive G29 and roughly ten on a 20 Nm direct drive base. The same number is a nudge on
+newton-metre on a gear-drive G29 and roughly ten on a 20 Nm direct drive base. The same number is a nudge on
 one device and a wrist injury on another.
 
 So:
@@ -133,6 +139,7 @@ Issues and PRs welcome.
 | `--steer-degrees N` | wheel degrees per side mapped to full stick deflection (default 45) |
 | `--wheel-range N` | your wheel's lock-to-lock range in degrees (default 900) |
 | `--no-input` | force feedback only; do not present a virtual pad |
+| `--headless` | no window |
 | `--device N` | force a specific SDL haptic index |
 | `--port N` | listen port (default 38480) |
 
