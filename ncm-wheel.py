@@ -601,38 +601,15 @@ class Input:
                           % (i, nm, "; ".join(roles) if roles else "available, not assigned"), flush=True)
                     continue
 
-                # **One device can hold two roles.** A Thrustmaster presents wheel and pedals together.
-                if self.steering is None and centred and n_buttons < 26:
-                    axis = (profile or {}).get("axes", {}).get("steer", centred[0])
-                    self.steering, self.steer_axis = dev, axis
-                    self.detected_class = (profile or {}).get("device_class", "unknown")
-                    roles.append("steering ax%d" % axis)
-                if pedal_axes and self.pedals is None:
-                    self.pedals = dev
-                    mapped = (profile or {}).get("axes") or {}
-                    for which, fallback in (("throttle", 0), ("brake", 1), ("clutch", 2)):
-                        if which in mapped:
-                            self.pedal_axes[which] = mapped[which]
-                        elif fallback < len(pedal_axes):
-                            # Convention for a combined wheel, in axis order: throttle, brake, clutch. It is
-                            # a guess, so it is PRINTED -- a tester who finds them swapped can say so, and
-                            # a profile entry then makes it permanent for that hardware.
-                            self.pedal_axes[which] = pedal_axes[fallback]
-                    roles.append("pedals " + ", ".join(
-                        "%s=ax%s" % (k, v) for k, v in sorted(self.pedal_axes.items())))
-                if not roles and self.rim is None and (
-                        (profile or {}).get("role") == "rim" or
-                        any(h in nm.lower() for h in RIM_HINTS) or (n_buttons >= 26 and not pedal_axes)):
-                    self.rim = dev
-                    roles.append("%d buttons" % n_buttons)
+                # Nothing is claimed here. Enumeration order used to decide who won a role, which is the
+                # wrong judge: a 25-button G29 would take the rim role before a dedicated button box further
+                # down the list was ever looked at. Collect now, choose in `_assign_roles`.
+                print("[in ] found   : %d %s%s -- %d axes (%d centred, %d at rest), %d buttons"
+                      % (i, nm, (" [%s]" % tag) if tag else "", n_axes, len(centred), len(pedal_axes),
+                         n_buttons), flush=True)
 
-                if roles:
-                    print("[in ] %-8s: %d %s%s -- %s"
-                          % ("device", i, nm, (" [%s]" % tag) if tag else " [detected]", "; ".join(roles)),
-                          flush=True)
-                    self.devices.append(dev)
-                else:
-                    sdl2.SDL_JoystickClose(handle)
+            if not (self.overrides.get("roles") or {}):
+                self._assign_roles()
 
             if self.steering is None and not self.controllers:
                 return "nothing usable attached"
@@ -642,6 +619,62 @@ class Input:
             return ""
         except Exception as exc:                                # noqa: BLE001 - diagnostic path
             return "input open failed: %s" % exc
+
+    def _assign_roles(self):
+        """Choose which device plays which role, looking at all of them together.
+
+        Preference order, most specific first:
+          * a profile that names the role outright
+          * a device that can only be that thing (pedals with no centred axis, a button box with no axes)
+          * the wheel itself, which on an all-in-one unit legitimately holds all three
+        """
+        cands = self.candidates
+
+        def profiled(role):
+            return [d for d in cands if (d.profile or {}).get("role") == role]
+
+        # --- steering: an axis that rests at centre ---
+        pool = profiled("steering") or [d for d in cands if d.centred_axes and d.button_count < 26] or [d for d in cands if d.centred_axes]
+        if pool:
+            dev = pool[0]
+            self.steering = dev
+            self.steer_axis = (dev.profile or {}).get("axes", {}).get(
+                "steer", dev.centred_axes[0] if dev.centred_axes else 0)
+            self.detected_class = (dev.profile or {}).get("device_class", "unknown")
+
+        # --- pedals: axes that rest at an end of travel ---
+        pool = profiled("pedals") or [d for d in cands if d.rest_axes and not d.centred_axes] or [d for d in cands if d.rest_axes]
+        if pool:
+            dev = pool[0]
+            self.pedals = dev
+            mapped = (dev.profile or {}).get("axes") or {}
+            for which, nth in (("throttle", 0), ("brake", 1), ("clutch", 2)):
+                if which in mapped:
+                    self.pedal_axes[which] = mapped[which]
+                elif nth < len(dev.rest_axes):
+                    # Axis order is a convention, not a fact, so it is printed for a tester to correct.
+                    self.pedal_axes[which] = dev.rest_axes[nth]
+
+        # --- buttons: a dedicated box first, then whatever the wheel itself offers ---
+        pool = (profiled("rim")
+                or [d for d in cands if d.button_count >= 12 and not d.centred_axes and not d.rest_axes]
+                or [d for d in cands if d is not self.steering and d.button_count >= 12]
+                or [d for d in cands if d.button_count > 0])
+        if pool:
+            self.rim = pool[0]
+
+        for dev in cands:
+            roles = []
+            if dev is self.steering:
+                roles.append("steering ax%d" % self.steer_axis)
+            if dev is self.pedals:
+                roles.append("pedals " + ", ".join("%s=ax%s" % (k, v)
+                                                   for k, v in sorted(self.pedal_axes.items())))
+            if dev is self.rim:
+                roles.append("%d buttons%s" % (dev.button_count,
+                             "" if (dev.profile or {}).get("buttons") else " (default map)"))
+            if roles:
+                print("[in ] %-8s: %s -- %s" % ("assigned", dev.name, "; ".join(roles)), flush=True)
 
     def _calibrate_pedals(self):
         """Rest positions are learned during detection; this only reports them and covers the case where SDL
@@ -719,13 +752,29 @@ class Input:
                     state["buttons"].add(name)
         return state
 
+    # Used when a wheel has buttons and no profile. DirectInput wheels vary, but the first few buttons are
+    # face buttons and shoulders far more often than not, so this is a reasonable start.
+    #
+    # **`home` is deliberately absent.** It is the Guide button: binding it to an unknown paddle could drop
+    # somebody out of the game mid-corner, and an unmapped button is a much smaller problem than that. `ls`
+    # and `rs` are left out for the same reason -- a stick click bound to a paddle is a surprise nobody asked
+    # for. Anything wrong here is fixable in Devices...
+    DEFAULT_RIM_BUTTONS = {
+        0: "a", 1: "b", 2: "x", 3: "y",
+        4: "lb", 5: "rb", 6: "back", 7: "start",
+        8: "dpad_up", 9: "dpad_down", 10: "dpad_left", 11: "dpad_right",
+    }
+
     def _rim_buttons(self):
-        """Rim buttons, per profile. No profile means no rim buttons -- guessing which one is `a` on an
-        unknown rim could bind `home` to a paddle and drop a player out of the game."""
+        """Rim buttons. A profile is authoritative; without one, a conservative default map applies so an
+        unrecognised wheel is not left unable to press anything."""
         out = set()
         if self.rim is None:
             return out
         mapping = self.rim.profile.get("buttons") or {}
+        if not mapping:
+            mapping = {k: v for k, v in self.DEFAULT_RIM_BUTTONS.items()
+                       if k < max(1, self.rim.button_count)}
         ignored = set(self.rim.profile.get("ignore_buttons") or [])
         for raw_index, target in mapping.items():
             index = int(raw_index)
