@@ -104,7 +104,22 @@ A combined wheel-and-pedals unit is handled: one device can hold both roles.
 **Your gamepad keeps working.** Wheel and controller both feed the same virtual pad and the larger deflection
 wins, so you can keep a controller in your hands for on foot and the wheel in front of you for driving.
 
-### Adding your wheel
+### If it gets your hardware wrong
+
+**Press `Devices...` in the window.** Detection is a proposal, not a diagnosis — it reads a rig by where its
+axes rest, which works well until it meets a load cell that rests mid-travel, a handbrake that looks like a
+pedal, or a rim that enumerates as something else.
+
+Every role is a dropdown: which device steers and on which axis, which device has the pedals and which axis
+is throttle, brake and clutch, which device has the buttons, and what type of wheelbase it is. Pick, press
+**Apply and reload**, and it re-reads your rig without a restart. Your choice is saved to
+`%LOCALAPPDATA%\NCM Wheel Support\devices.json` and used from then on. **Use automatic detection** puts it
+back.
+
+Anything you leave as `(none)` stays unassigned rather than being guessed into a role you deliberately left
+empty.
+
+### Adding your wheel to the shipped profiles
 
 Run with `--monitor` to see live axis and button values, then add an entry to `wheel-profiles/default.json`
 and open a PR or an issue with it. Pedal assignment in axis order (throttle, brake, clutch) is a convention
@@ -138,6 +153,7 @@ Issues and PRs welcome.
 | `--wheel-range N` | your wheel's lock-to-lock range in degrees (default 900) |
 | `--no-input` | force feedback only; do not present a virtual pad |
 | `--headless` | no window |
+| `--log FILE` | append everything to a file (a packaged build has no console) |
 | `--device N` | force a specific SDL haptic index |
 | `--port N` | listen port (default 38480) |
 
