@@ -53,6 +53,15 @@ jobs:
           }
           "VGAMEPAD_PKG=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Effect lifecycle test
+        shell: pwsh
+        run: |
+          # Guards the defect a T128 owner found by hand on 2026-09-25: effects were run once at arm time
+          # and never again, so the first stop() of a session silenced the wheel until re-arm. It produced
+          # no error and read as correct. Runs against a fake device, so it needs no hardware.
+          python test_resume.py
+          if ($LASTEXITCODE -ne 0) { throw "effect lifecycle test failed" }
+
       - name: Build
         shell: pwsh
         run: |
