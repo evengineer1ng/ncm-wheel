@@ -140,3 +140,7 @@ receives the Lua bridge. Telemetry goes up that socket at 30 Hz; settings come b
 - [ViGEmBus](https://github.com/nefarius/ViGEmBus) for the virtual controller
 - Logitech G HUB, for Logitech wheels
 - Python 3.10+ only if running from source
+
+## License
+
+MIT. See [LICENSE](LICENSE).
