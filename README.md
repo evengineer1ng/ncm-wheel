@@ -16,16 +16,21 @@ which is how this sort of thing usually has to be done in a game with no native 
 
 - **Steering, pedals and buttons** — your rig is presented to the game as a standard Xbox 360 controller.
 - **Force feedback** — spring, damper, road texture and engine feel, from live telemetry.
-- **Settings in the game** — device list, strength, centring, stiffness and mix all live in the NCM panel.
-  There is no separate configuration window.
+- **Feel settings in the game** — strength, centring, stiffness and the mix all live in the NCM panel, on
+  sliders, while you are sitting in the car.
+- **A status window** that says what it found, whether the game is connected, and what is wrong — with one
+  button that copies the lot to your clipboard.
+- **Dropdowns for your hardware**, if detection gets it wrong.
 
 ## Why there is a companion program at all
 
 Nothing inside the game can reach an HID device. A game resource has no sockets and no device access, in
 either direction — so something outside the game has to read your wheel and drive its motors.
 
-That is all this program is: a device shim. It holds no settings of its own and has no interface. The game
-enumerates your hardware through it, decides when the rig is live, tunes the feel, and feeds it telemetry.
+That is all this program is: a device shim with a status window. The game enumerates your hardware through
+it, decides when the rig is live, tunes the feel, and feeds it telemetry. The window exists to tell you what
+is happening and to let you correct what device is what — everything about how the car *feels* is set in
+the game, where you are already sitting.
 
 **Telemetry never leaves your machine.** It is scoped to your own occupied vehicle, by construction.
 
@@ -180,3 +185,29 @@ trust a binary at all, [build it yourself](#running-from-source-instead) — it 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Changelog
+
+### 0.2.0
+
+- **A status window.** It was built to be invisible, which was the wrong trade for something strangers
+  install: an invisible program can only report a problem to a log file. It now shows what it found, whether
+  the game is connected, and anything that needs acting on — plus **Copy diagnostics**, so nobody is ever
+  asked to go and find a log.
+- **`Devices...` dropdowns.** Detection reads a rig by where its axes rest, which is a good default and a bad
+  guarantee on hardware nobody here has seen. Every role can now be reassigned by hand and is remembered.
+- **ViGEmBus is offered, not demanded.** If the driver is missing the program explains what it is and offers
+  to fetch it, shows the URL first, and refuses to run the installer unless it is validly signed.
+- **Fixed: the packaged build was broken in ways the source was not.** The device profiles were never
+  bundled, so a release ran with none of them; `vgamepad`'s ViGEmClient DLL was never bundled, so a release
+  could never create a virtual pad at all. Both are bundled now, and the build is smoke-tested in CI.
+- **Fixed: a confidently wrong error message.** The above surfaced as *"ViGEmBus is not installed"* on
+  machines where it was installed and running. It now checks before blaming, and says plainly when a fault
+  is ours.
+- **Fixed:** force levels recalibrated after measurement on a real wheel — ceilings came down by roughly 60%,
+  and the ladder starts lower and steps finer. The G29 is gear drive, not belt, and is now labelled correctly.
+- `--log FILE` and `--headless`.
+
+### 0.1.0
+
+First release. Wheel, pedals and telemetry-driven force feedback.

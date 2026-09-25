@@ -58,7 +58,7 @@ STATE = {
     "port": None, "listening": False, "connected": False, "armed": False,
     "wheel": None, "pedals": None, "rim": None, "gamepads": [],
     "device": None, "device_class": None, "rung": None, "problems": [],
-    "frames": 0, "version": "0.1.0",
+    "frames": 0, "version": "0.2.0",
 }
 
 

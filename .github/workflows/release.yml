@@ -80,17 +80,25 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          draft: true          # so the changelog can be read before anyone downloads it
+          draft: false
           generate_release_notes: true
           files: |
             dist/NCM Wheel Support.exe
             dist/SHA256SUMS.txt
           body: |
-            **Alpha.** Force levels were measured on a Logitech G29 (gear drive) by walking the full
-            ladder — that measurement moved the original reasoned numbers by about 2.5x. The belt and
-            direct-drive ceilings are scaled down from that baseline rather than measured on those
-            wheelbases, so they deliberately start low. If you have either, the README's safety section
-            explains what is useful to report.
+            Wheel, pedals and force feedback for Cyberpunk 2077 multiplayer on OPEN//77, driven by real
+            vehicle telemetry rather than by an FFT over game audio.
+
+            **What changed in this release is in the [changelog](../../#changelog).** The short version: it
+            has a window now, hardware can be reassigned by hand when detection gets it wrong, ViGEmBus is
+            offered rather than demanded — and two bugs are fixed that only existed in the packaged build,
+            where the device profiles and the virtual-controller DLL were never bundled.
+
+            **Alpha.** Force levels were measured on a Logitech G29 (gear drive) by walking the full ladder;
+            that measurement moved the original reasoned numbers by about 2.5x. The belt and direct-drive
+            ceilings are scaled down from that baseline rather than measured on those wheelbases, so they
+            deliberately start low. If you have either, the README's safety section says what is useful to
+            report.
 
             Built by GitHub Actions from the tagged source. Verify with `SHA256SUMS.txt`:
 
