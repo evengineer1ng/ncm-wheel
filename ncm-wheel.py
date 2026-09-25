@@ -765,16 +765,39 @@ class Input:
         8: "dpad_up", 9: "dpad_down", 10: "dpad_left", 11: "dpad_right",
     }
 
+    def rim_pressed(self):
+        """Which buttons are held on the button device right now. Used by the binding dialog, which needs
+        to see a press rather than be told about one."""
+        out = []
+        if self.rim is None or self.sdl is None:
+            return out
+        try:
+            self.sdl.SDL_JoystickUpdate()
+            for i in range(self.rim.button_count):
+                if self.sdl.SDL_JoystickGetButton(self.rim.handle, i):
+                    out.append(i)
+        except Exception:                                       # noqa: BLE001
+            pass
+        return out
+
+    def button_map(self):
+        """The map in force, and where it came from. Precedence: what the user bound, then a shipped
+        profile, then the default guess."""
+        user = ((self.overrides.get("roles") or {}).get("rim") or {}).get("buttons")
+        if user:
+            return {int(k): v for k, v in user.items()}, "yours"
+        if self.rim is not None and (self.rim.profile or {}).get("buttons"):
+            return {int(k): v for k, v in self.rim.profile["buttons"].items()}, "profile"
+        count = self.rim.button_count if self.rim else 0
+        return {k: v for k, v in self.DEFAULT_RIM_BUTTONS.items() if k < max(1, count)}, "default guess"
+
     def _rim_buttons(self):
         """Rim buttons. A profile is authoritative; without one, a conservative default map applies so an
         unrecognised wheel is not left unable to press anything."""
         out = set()
         if self.rim is None:
             return out
-        mapping = self.rim.profile.get("buttons") or {}
-        if not mapping:
-            mapping = {k: v for k, v in self.DEFAULT_RIM_BUTTONS.items()
-                       if k < max(1, self.rim.button_count)}
+        mapping, _ = self.button_map()
         ignored = set(self.rim.profile.get("ignore_buttons") or [])
         for raw_index, target in mapping.items():
             index = int(raw_index)
@@ -1665,6 +1688,149 @@ class VigemDialog(object):
 # setting lives in the game, where the driver already is.
 
 
+class ButtonsDialog(object):
+    """Bind each Xbox control by pressing the button you want for it.
+
+    **`home` is offered but marked**, because binding the Guide button to a paddle you brush mid-corner drops
+    you out of the game. It is available for anyone who genuinely wants it and is not something to assign by
+    accident.
+    """
+
+    TARGETS = (
+        ("a", "A"), ("b", "B"), ("x", "X"), ("y", "Y"),
+        ("lb", "LB"), ("rb", "RB"),
+        ("back", "Back / View"), ("start", "Start / Menu"),
+        ("dpad_up", "D-pad up"), ("dpad_down", "D-pad down"),
+        ("dpad_left", "D-pad left"), ("dpad_right", "D-pad right"),
+        ("ls", "Left stick click"), ("rs", "Right stick click"),
+        ("home", "Guide  (careful)"),
+    )
+
+    def __init__(self, tk, rig, on_apply):
+        self.tk, self.rig, self.on_apply = tk, rig, on_apply
+        self.learning = None
+
+    def show(self):
+        tk = self.tk
+        bg, fg, dim = "#0d1117", "#d8e0e8", "#8b98a5"
+        current, source = self.rig.button_map()
+        self.bindings = dict(current)
+
+        win = tk.Toplevel()
+        win.title("Buttons")
+        win.configure(bg=bg)
+        win.geometry("560x620")
+        win.grab_set()
+
+        rim = self.rig.rim
+        tk.Label(win, text="BUTTONS", bg=bg, fg=fg,
+                 font=("Consolas", 12, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(win, text=("%s — %d buttons.  Current map: %s.\nPress LEARN, then press the button on "
+                            "your wheel." % (rim.name if rim else "no button device",
+                                             rim.button_count if rim else 0, source)),
+                 bg=bg, fg=dim, font=("Consolas", 9), justify="left",
+                 anchor="w", wraplength=520).pack(anchor="w", padx=16, pady=(0, 6))
+
+        self.live = tk.Label(win, text="held: none", bg=bg, fg="#5dd39e", font=("Consolas", 9), anchor="w")
+        self.live.pack(anchor="w", padx=16, pady=(0, 8))
+
+        canvas = tk.Canvas(win, bg=bg, highlightthickness=0, height=380)
+        scroll = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        grid = tk.Frame(canvas, bg=bg)
+        grid.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=grid, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="top", fill="both", expand=True, padx=(16, 0))
+        scroll.pack(side="top", fill="y", anchor="e")
+
+        self.rows = {}
+        for r, (key, label) in enumerate(self.TARGETS):
+            tk.Label(grid, text=label, bg=bg, fg=dim, font=("Consolas", 9),
+                     anchor="w", width=18).grid(row=r, column=0, sticky="w", pady=2)
+            val = tk.Label(grid, text="-", bg=bg, fg=fg, font=("Consolas", 9), anchor="w", width=12)
+            val.grid(row=r, column=1, sticky="w")
+            tk.Button(grid, text="Learn", command=lambda k=key: self._learn(k), relief="flat",
+                      bg="#1c2530", fg=fg, font=("Consolas", 8), padx=8).grid(row=r, column=2, padx=3)
+            tk.Button(grid, text="Clear", command=lambda k=key: self._clear(k), relief="flat",
+                      bg="#1c2530", fg=fg, font=("Consolas", 8), padx=8).grid(row=r, column=3)
+            self.rows[key] = val
+
+        self.note = tk.Label(win, text="", bg=bg, fg="#f0a04b", font=("Consolas", 9), anchor="w")
+        self.note.pack(fill="x", padx=16, pady=(6, 0))
+
+        bar = tk.Frame(win, bg=bg)
+        bar.pack(side="bottom", fill="x", padx=16, pady=12)
+
+        def apply():
+            data = load_overrides()
+            roles = data.get("roles") or {}
+            rim_entry = roles.get("rim") or {}
+            if rim and not rim_entry.get("name"):
+                rim_entry["name"] = rim.name
+            rim_entry["buttons"] = {str(i): t for i, t in self.bindings.items()}
+            roles["rim"] = rim_entry
+            data["roles"] = roles
+            if save_overrides(data):
+                self.note.configure(text="Saved. Re-reading...")
+                win.update_idletasks()
+                self.on_apply()
+                win.after(700, win.destroy)
+            else:
+                self.note.configure(text="Could not save.")
+
+        def use_default():
+            self.bindings = dict(self.rig.DEFAULT_RIM_BUTTONS)
+            self._redraw()
+            self.note.configure(text="Default guess restored — not yet saved.")
+
+        tk.Button(bar, text="Save", command=apply, relief="flat", bg="#1f6feb", fg="#ffffff",
+                  font=("Consolas", 9), padx=12, pady=6).pack(side="left")
+        tk.Button(bar, text="Reset to default guess", command=use_default, relief="flat", bg="#1c2530",
+                  fg=fg, font=("Consolas", 9), padx=12, pady=6).pack(side="left", padx=8)
+        tk.Button(bar, text="Close", command=win.destroy, relief="flat", bg="#1c2530", fg=fg,
+                  font=("Consolas", 9), padx=12, pady=6).pack(side="right")
+
+        self.win = win
+        self._redraw()
+        self._poll()
+        win.wait_window()
+
+    def _redraw(self):
+        for key, lbl in self.rows.items():
+            idx = next((i for i, t in self.bindings.items() if t == key), None)
+            lbl.configure(text=("button %d" % idx) if idx is not None else "-",
+                          fg="#d8e0e8" if idx is not None else "#5a6672")
+
+    def _learn(self, key):
+        self.learning = key
+        self.note.configure(text="Press the button you want for %s..." % key.upper())
+
+    def _clear(self, key):
+        for i, t in list(self.bindings.items()):
+            if t == key:
+                del self.bindings[i]
+        self._redraw()
+        self.note.configure(text="%s unbound — not yet saved." % key.upper())
+
+    def _poll(self):
+        held = self.rig.rim_pressed()
+        self.live.configure(text="held: " + (", ".join(str(h) for h in held) if held else "none"))
+        if self.learning and held:
+            index = held[0]
+            # One button, one target: clear anything else this index was bound to, and anything else bound
+            # to this target, or a rim quietly ends up sending two things at once.
+            self.bindings = {i: t for i, t in self.bindings.items()
+                             if i != index and t != self.learning}
+            self.bindings[index] = self.learning
+            self.note.configure(text="%s = button %d" % (self.learning.upper(), index))
+            self.learning = None
+            self._redraw()
+        try:
+            self.win.after(120, self._poll)
+        except Exception:                                       # noqa: BLE001 - window closed
+            pass
+
+
 class DevicesDialog(object):
     """Reassign roles by hand.
 
@@ -1803,6 +1969,9 @@ class DevicesDialog(object):
 
         tk.Button(bar, text="Apply and reload", command=apply, relief="flat", bg="#1f6feb",
                   fg="#ffffff", font=("Consolas", 9), padx=12, pady=6).pack(side="left")
+        tk.Button(bar, text="Map buttons...", command=lambda: ButtonsDialog(
+            self.tk, self.rig, self.on_apply).show(), relief="flat", bg="#1c2530", fg=fg,
+            font=("Consolas", 9), padx=12, pady=6).pack(side="left", padx=8)
         tk.Button(bar, text="Use automatic detection", command=reset, relief="flat", bg="#1c2530",
                   fg=fg, font=("Consolas", 9), padx=12, pady=6).pack(side="left", padx=8)
         tk.Button(bar, text="Close", command=win.destroy, relief="flat", bg="#1c2530",

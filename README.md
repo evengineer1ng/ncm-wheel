@@ -124,6 +124,20 @@ back.
 Anything you leave as `(none)` stays unassigned rather than being guessed into a role you deliberately left
 empty.
 
+### If the buttons are wrong
+
+**Devices... → Map buttons...** Press **Learn** next to a control, then press the button you want for it on
+your wheel. The dialog shows which buttons are held as you press them, so you can also just prod things to
+see what is what.
+
+Wheels this project has never seen get a default guess at the button layout — face buttons first, then
+shoulders, then D-pad — because an unrecognised wheel that cannot press anything is worse than one with a
+best guess. It is only a guess, and this is how you correct it. Bindings are saved with your other device
+choices.
+
+`Guide` is offered but marked: binding it to a paddle you brush mid-corner drops you out of the game, so it
+is deliberately not part of the default guess.
+
 ### Adding your wheel to the shipped profiles
 
 Run with `--monitor` to see live axis and button values, then add an entry to `wheel-profiles/default.json`
