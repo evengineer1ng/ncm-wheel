@@ -1,9 +1,9 @@
 name: Build and release
 
-# Builds the companion on a clean Windows runner and attaches it to a release, so the binary people download
-# is demonstrably produced from the public source rather than from someone's desktop. For an unsigned tool
-# that drives force-feedback hardware, a reproducible public build is worth more trust than a signature from
-# a name nobody recognises.
+# Builds the companion on a clean Windows runner and attaches it to the release, so the binary people
+# download is demonstrably produced from the public source rather than from someone's desktop. For an
+# unsigned tool that drives force-feedback hardware, a reproducible public build is worth more trust than a
+# signature from a name nobody recognises.
 
 on:
   push:
@@ -16,6 +16,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # **A hung job is worse than a failed one.** Three runs sat "in progress" for hours because a dependency
+    # installer was waiting for input that was never coming, and a stuck run reports nothing at all.
+    timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,21 +27,42 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Install build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          # vgamepad ships the ViGEmBus installer and may try to run it during install. On a runner that is
-          # pointless and can be noisy, but only the PYTHON package is needed to BUILD -- the driver is a
-          # requirement on the player's machine, not here. So a driver-install failure must not fail the build.
           python -m pip install pysdl2 pysdl2-dll pyinstaller
-          try { python -m pip install vgamepad } catch { Write-Host "vgamepad install reported a problem; continuing" }
-          python -c "import vgamepad" 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::vgamepad python package unavailable -- the virtual controller half cannot be built"
-            exit 1
+
+      - name: Install vgamepad without running its driver installer
+        shell: pwsh
+        run: |
+          # `pip install vgamepad` runs the ViGEmBus setup program during installation. On a desktop that is
+          # a UAC prompt; on a headless runner it is a process waiting for input that never comes, which is
+          # exactly how three builds hung with no output. A try/catch cannot help -- nothing ever returns.
+          #
+          # So: fetch the distribution and install it WITHOUT executing its setup code. A wheel cannot run
+          # code at install time, which is the whole reason to prefer one. The driver is a requirement on the
+          # player's machine, never on the builder's.
+          New-Item -ItemType Directory -Force -Path dist-deps | Out-Null
+          python -m pip download vgamepad --no-deps --dest dist-deps
+          $whl = Get-ChildItem dist-deps -Filter *.whl | Select-Object -First 1
+          if ($whl) {
+            Write-Host "installing wheel $($whl.Name) with --no-deps (no setup code runs)"
+            python -m pip install --no-deps $whl.FullName
+          } else {
+            # No wheel published: unpack the sdist and drop the package into site-packages by hand, still
+            # without running setup.py.
+            $sdist = Get-ChildItem dist-deps -Recurse -Include *.tar.gz,*.zip | Select-Object -First 1
+            if (-not $sdist) { throw "pip download produced neither a wheel nor an sdist" }
+            Write-Host "no wheel published; unpacking $($sdist.Name)"
+            tar -xf $sdist.FullName -C dist-deps
+            $pkg = Get-ChildItem dist-deps -Directory -Recurse -Filter vgamepad | Select-Object -First 1
+            if (-not $pkg) { throw "vgamepad package directory not found in the sdist" }
+            $site = python -c "import site; print(site.getsitepackages()[-1])"
+            Copy-Item -Recurse -Force $pkg.FullName (Join-Path $site 'vgamepad')
           }
-          Write-Host "vgamepad importable"
+          python -c "import vgamepad, os; print('vgamepad at', os.path.dirname(vgamepad.__file__))"
+          if ($LASTEXITCODE -ne 0) { throw "vgamepad is not importable; the virtual controller cannot be built" }
 
       - name: Build
         shell: pwsh
@@ -46,20 +71,29 @@ jobs:
             --name "NCM Wheel Support" `
             --collect-all sdl2dll `
             --collect-all vgamepad `
-            --add-data 'wheel-profiles;wheel-profiles' `
+            --add-data "wheel-profiles;wheel-profiles" `
             --hidden-import sdl2 `
             --hidden-import vgamepad `
             --hidden-import tkinter `
             ncm-wheel.py
           if (-not (Test-Path "dist\NCM Wheel Support.exe")) { throw "build produced no exe" }
+          Get-ChildItem dist
 
       - name: Smoke test the binary
         shell: pwsh
         run: |
-          # A runner has no wheel, so this proves the exe starts, parses arguments and loads its profiles --
-          # not that it can drive hardware. Worth doing anyway: a bundle missing sdl2dll fails exactly here.
-          $p = Start-Process -FilePath "dist\NCM Wheel Support.exe" -ArgumentList '--help' -PassThru -Wait
-          Write-Host "exit code: $($p.ExitCode)"
+          # A runner has no wheel, so this proves the exe starts, unpacks and finds its own bundled data --
+          # precisely what 0.1.0 got wrong twice, silently, in ways a source build never showed.
+          $log = Join-Path $env:TEMP 'smoke.log'
+          $p = Start-Process -FilePath "dist\NCM Wheel Support.exe" -PassThru `
+               -ArgumentList '--headless','--no-input','--port','38499','--log',$log
+          Start-Sleep -Seconds 25
+          if (-not $p.HasExited) { $p.Kill() }
+          if (-not (Test-Path $log)) { throw "the packaged build produced no output at all" }
+          Get-Content $log
+          if ((Get-Content $log -Raw) -match 'no rig profiles loaded') {
+            throw "the bundled wheel-profiles were not found inside the exe"
+          }
 
       - name: Checksums
         shell: pwsh
@@ -82,6 +116,7 @@ jobs:
         with:
           draft: false
           generate_release_notes: true
+          fail_on_unmatched_files: true      # a release with no binary is worse than no release
           files: |
             dist/NCM Wheel Support.exe
             dist/SHA256SUMS.txt
@@ -89,10 +124,13 @@ jobs:
             Wheel, pedals and force feedback for Cyberpunk 2077 multiplayer on OPEN//77, driven by real
             vehicle telemetry rather than by an FFT over game audio.
 
-            **What changed in this release is in the [changelog](../../#changelog).** The short version: it
-            has a window now, hardware can be reassigned by hand when detection gets it wrong, ViGEmBus is
-            offered rather than demanded — and two bugs are fixed that only existed in the packaged build,
-            where the device profiles and the virtual-controller DLL were never bundled.
+            **What changed is in the [changelog](../../#changelog).** The short version: it has a window
+            now, hardware can be reassigned by hand when detection gets it wrong, ViGEmBus is offered rather
+            than demanded — and two bugs are fixed that existed only in the packaged build, where the device
+            profiles and the virtual-controller DLL were never bundled.
+
+            **You do not need Python.** Everything is inside the exe, verified by running it with Python
+            removed from the environment.
 
             **Alpha.** Force levels were measured on a Logitech G29 (gear drive) by walking the full ladder;
             that measurement moved the original reasoned numbers by about 2.5x. The belt and direct-drive
@@ -106,5 +144,7 @@ jobs:
             Get-FileHash ".\NCM Wheel Support.exe" -Algorithm SHA256
             ```
 
-            **Requirements:** [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) for wheel and pedal
-            input, and Logitech G HUB if you have a Logitech wheel.
+            **Requirements:** Windows 10/11. [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) for
+            wheel and pedal input — the program offers to install it for you — and Logitech G HUB if you
+            have a Logitech wheel. Windows SmartScreen will warn on first run because the binary is not code
+            signed; choose **More info → Run anyway**, or build it from source.
