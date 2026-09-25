@@ -110,6 +110,34 @@ FRAME_VERSION = 1
 # the constant centring effect was "fairly strong from first rung to too strong by the end". Lower floor,
 # finer steps, ceilings down by roughly 60%. Mirrors driver.feedback, which is authoritative.
 CEILING = {"gear": 0.24, "belt": 0.20, "direct_drive": 0.06, "unknown": 0.04}
+# **Engine vibration frequency, in Hz, across the rev range.** IDLE at zero revs rising to IDLE+SPAN at
+# redline. Not the true firing frequency (rpm/30, which reaches 233 Hz and is the razor we are escaping) but
+# the sub-harmonic hands actually read as an engine. A wheel motor articulates this band; above roughly
+# 60 Hz most of them just whine.
+ENGINE_HZ_IDLE = 12.0
+ENGINE_HZ_SPAN = 35.0
+
+
+def engine_period_ms(ratio):
+    """Milliseconds per cycle for a given rpm/redline ratio. SDL wants a period, not a frequency."""
+    try:
+        r = float(ratio)
+    except (TypeError, ValueError):
+        r = 0.0
+    # **NaN survives float() and defeats every comparison**, so the clamps below pass it straight through to
+    # int(), which raises -- inside write(), whose handler then silences the wheel. `Knowledge.reading`
+    # rejects NaN explicitly for exactly this reason and this is the same rule on the other side of the wire.
+    if r != r:
+        r = 0.0
+    r = 0.0 if r < 0.0 else (1.0 if r > 1.0 else r)
+    hz = ENGINE_HZ_IDLE + ENGINE_HZ_SPAN * r
+    return max(1, int(round(1000.0 / hz)))
+
+
+# Raw suspension units -> 0..1. **1.0 means "not yet measured"**, which reproduces the previous behaviour
+# exactly rather than inventing a correction. Raise it once `--observe` has reported a real peak: if a hard
+# kerb strike peaks at 0.04, this becomes 25.
+ROAD_SCALE = 1.0
 FLOOR = 0.02
 STEP = 0.02
 MAX_SLEW_PER_SECOND = 1.5
@@ -957,7 +985,12 @@ class Output:
         self.axes = 1
         self.last_texture = -1.0
         self.last_torque = None
+        self.last_period = engine_period_ms(0.0)
         self._registered = False
+        # **Are the effects actually PLAYING?** Not "do they exist" -- a stopped effect still exists, still
+        # accepts parameter updates, and produces no force whatsoever. Keeping this separate from the effect
+        # ids is the whole fix: `stop()` clears it, `write()` restores it.
+        self._playing = False
 
     # ---------------------------------------------------------------- lifecycle
     def open(self):
@@ -1056,6 +1089,7 @@ class Output:
             if not modes:
                 return "device created no usable effect"
             self.mode = "+".join(modes)
+            self._playing = True
 
             if not self._registered:
                 atexit.register(self.close)
@@ -1071,7 +1105,9 @@ class Output:
         e.periodic.type = h.SDL_HAPTIC_SINE
         e.periodic.direction = h.SDL_HapticDirection(h.SDL_HAPTIC_CARTESIAN, (c_long * 3)(1, 0, 0))
         e.periodic.length = 0xFFFFFFFF
-        e.periodic.period = 8                                   # 125 Hz: texture. 25 Hz was swallowed whole.
+        # Starts at idle and is rewritten per frame from the rev ratio -- see `engine_period_ms`. The old
+        # value here was a constant 8 ms (125 Hz), tuned by feel on a single gear-drive wheel.
+        e.periodic.period = engine_period_ms(0.0)
         e.periodic.magnitude = int(magnitude)
         e.periodic.offset = 0
         e.periodic.phase = 0
@@ -1107,6 +1143,9 @@ class Output:
         entry = self.conditions.get(kind)
         if not entry or self.haptic is None or self.dev is None:
             return False
+        # Same trap as `write()`: a stopped condition accepts the update and produces nothing. This path is
+        # reached when a slider moves with the car stationary, so it cannot rely on a frame arriving first.
+        self._resume()
         eff, eid = entry
         sat = int(max(0.0, min(1.0, strength)) * 32767)
         for axis in range(self.axes):
@@ -1131,23 +1170,57 @@ class Output:
         return e
 
     # ---------------------------------------------------------------- output
-    def write(self, texture, torque=0.0):
-        """`texture` 0..1 of buzz; `torque` -1..1 of centring force, sign carrying which way to push.
+    def _resume(self):
+        """Put every effect back into the PLAYING state.
+
+        Cheap and idempotent, and it has to be, because it runs on the first write after any silence. The
+        alternative -- re-creating the effects -- is what unarm/arm does, and it is both slower and the thing
+        that was papering over this bug."""
+        if self._playing or self.haptic is None or self.dev is None:
+            return
+        try:
+            ids = [self.sine_id, self.const_id] + [eid for _, eid in self.conditions.values()]
+            for eid in ids:
+                if eid is not None:
+                    self.haptic.SDL_HapticRunEffect(self.dev, eid, 1)
+            self._playing = True
+            # Neither cached value can be trusted across a silence: the device's own state was reset, so a
+            # value that matches the cache must still be re-sent or the first frame back is silent.
+            self.last_texture, self.last_torque = -1.0, None
+        except Exception:                                       # noqa: BLE001
+            pass
+
+    def write(self, texture, torque=0.0, engine=None):
+        """`texture` 0..1 of buzz; `torque` -1..1 of centring force, sign carrying which way to push;
+        `engine` 0..1 of rev ratio, which sets how FAST the buzz is rather than how strong.
+
+        `engine=None` means the rev ratio was not measured this frame, and the previous period is kept.
+        Absence is not zero here either: defaulting to idle would make a car at speed suddenly throb.
 
         Both are clamped here as well as by the caller. The redundant `min()` costs nothing and this is the
         last place a mistake is still cheap."""
         if self.mode == "none" or self.sdl is None:
             return
+        self._resume()
         texture = clamp(self.device_class, texture)
         ceiling = CEILING.get(self.device_class, CEILING["unknown"])
         torque = max(-ceiling, min(ceiling, torque if torque == torque else 0.0))
+        # Resolution RELATIVE to what this device can actually produce, not to an abstract 0..1.
+        grain = max(0.0002, ceiling / 500.0)
         try:
-            if self.sine_id is not None and abs(texture - self.last_texture) >= 0.005:
-                self.last_texture = texture
+            period = self.last_period
+            if engine is not None:
+                period = engine_period_ms(engine)
+            # One update carries both, because they live in the same effect: re-sending it for a magnitude
+            # change and again for a period change would be two USB writes for one state.
+            if self.sine_id is not None and (abs(texture - self.last_texture) >= grain
+                                             or period != self.last_period):
+                self.last_texture, self.last_period = texture, period
                 self.sine.periodic.magnitude = int(texture * 32767)
+                self.sine.periodic.period = period
                 self.haptic.SDL_HapticUpdateEffect(self.dev, self.sine_id, self.sine)
             if self.const_id is not None and (self.last_torque is None
-                                              or abs(torque - self.last_torque) >= 0.005):
+                                              or abs(torque - self.last_torque) >= grain):
                 self.last_torque = torque
                 self.const.constant.level = int(torque * 32767)
                 self.haptic.SDL_HapticUpdateEffect(self.dev, self.const_id, self.const)
@@ -1158,6 +1231,7 @@ class Output:
         """Silence. **Zero, then stop** -- an infinite effect that is merely 'stopped' has been observed to
         keep playing, so the magnitude is set to zero first and the effect is halted second."""
         self.last_texture, self.last_torque = -1.0, None
+        self._playing = False
         if self.haptic is None or self.dev is None:
             return
         try:
@@ -1206,11 +1280,16 @@ class Mixer:
         self.rung = rung
         self.level = 0.0
         self.torque = 0.0
+        self.engine_ratio = None        # rev ratio from the last frame that carried one; None = unmeasured
         self.last = time.monotonic()
         self.frames = 0
         self.idles = 0
         self.device_name = None
         self.caps = {}
+        # Observed magnitude of every raw channel, so a scale factor can be MEASURED instead of guessed.
+        # `road` is the one that needs it; the others are recorded because the same question will be asked
+        # about them and the answer costs two floats.
+        self.seen = {}
         # **Every one of these is a slider, not a constant.** The owner should never need an editor to change
         # how their wheel feels, and one person's preference is not a fact about the hardware.
         self.tune = {
@@ -1254,6 +1333,11 @@ class Mixer:
         }
         out["tune"] = dict(self.tune)
         out["caps"] = dict(self.caps)
+        out["seen"] = self.observations()
+        # Reported so a complaint about engine feel arrives with a number attached rather than a simile.
+        out["engineHz"] = (round(ENGINE_HZ_IDLE + ENGINE_HZ_SPAN * self.engine_ratio, 1)
+                           if self.engine_ratio is not None else None)
+        out["engineBand"] = [ENGINE_HZ_IDLE, ENGINE_HZ_IDLE + ENGINE_HZ_SPAN]
         if self.rig is not None:
             out["rig"] = self.rig.describe()
         return out
@@ -1268,6 +1352,7 @@ class Mixer:
             if self.rig is not None:
                 self.rig.seated = False
             self.idles += 1
+            self.engine_ratio = None
             self.level = slew(self.level, 0.0, dt)
             self.torque = slew(self.torque, 0.0, dt)
             self._emit()
@@ -1286,6 +1371,7 @@ class Mixer:
         num = lambda key: f[key] if isinstance(f.get(key), (int, float)) else None
         engine = num("engine")
         if engine is not None:
+            self.engine_ratio = engine
             # **A car should hum at idle.** Engine contribution used to scale straight from the RPM ratio, so
             # an idling engine at 15% of redline produced almost nothing. A floor means the machine is always
             # perceptibly running, and the rest still rises with revs.
@@ -1294,11 +1380,16 @@ class Mixer:
         for key, weight in (("slipTotal", 2.5), ("slipLong", 1.5), ("slipLat", 2.0)):
             v = num(key)
             if v is not None:
+                self._observe(key, v)
                 contributions.append(weight * self.tune["texture"] * min(1.0, abs(v)))
         for key in ("suspLong", "suspLat"):
             v = num(key)
             if v is not None:
-                contributions.append(1.2 * self.tune["road"] * min(1.0, abs(v)))
+                self._observe(key, v)
+                # ROAD_SCALE turns the engine's raw suspension units into 0..1. Until a drive has told us
+                # what those units are it stays 1.0, i.e. exactly the old behaviour -- a measurement that
+                # has not happened yet must not masquerade as one that has.
+                contributions.append(1.2 * self.tune["road"] * min(1.0, abs(v) * ROAD_SCALE))
         if not contributions:
             self.level = slew(self.level, 0.0, dt)
             self._emit()
@@ -1324,11 +1415,34 @@ class Mixer:
         self._emit()
         return self.level
 
+    def _observe(self, key, value) -> None:
+        """Remember the largest magnitude this channel has ever shown, and how often it was non-trivial.
+
+        A channel that is always present and always 0.003 is not a weak channel, it is a channel whose units
+        we have misread -- and that is indistinguishable from "the game does not send it" unless somebody
+        writes the number down."""
+        try:
+            mag = abs(float(value))
+        except (TypeError, ValueError):
+            return
+        row = self.seen.get(key)
+        if row is None:
+            row = self.seen[key] = {"max": 0.0, "frames": 0, "live": 0}
+        row["frames"] += 1
+        if mag > row["max"]:
+            row["max"] = mag
+        if mag > 0.001:
+            row["live"] += 1
+
+    def observations(self) -> dict:
+        """What the channels have actually been seen to do. Sent to the panel and printed on request."""
+        return {k: dict(v) for k, v in self.seen.items()}
+
     def _emit(self) -> None:
         """The single point where a level becomes force. Nothing else in this class touches the device, so
         'is force being applied?' has exactly one answer to check."""
         if self.out is not None:
-            self.out.write(self.level, self.torque)
+            self.out.write(self.level, self.torque, self.engine_ratio)
 
     def silence(self) -> None:
         self.level = 0.0
