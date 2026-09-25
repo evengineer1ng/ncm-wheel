@@ -41,7 +41,17 @@ jobs:
           # build metadata -- and on a headless runner it waits forever for input that never comes. Three
           # builds hung for hours before this was understood, which is why pip is kept away from it entirely.
           python tools-install-vgamepad.py
-          python -c "import vgamepad, os; print('vgamepad at', os.path.dirname(vgamepad.__file__))"
+          # **Do not import it to check it.** vgamepad connects to the ViGEmBus driver at IMPORT time and
+          # raises VIGEM_ERROR_BUS_NOT_FOUND without it -- which a build runner never has, and never needs:
+          # the driver is a requirement on the player's machine. Verify the FILES are in place instead.
+          $site = python -c "import site; print([p for p in site.getsitepackages() if p.endswith('site-packages')][-1])"
+          $pkg = Join-Path $site 'vgamepad'
+          foreach ($need in @('__init__.py', 'win/virtual_gamepad.py', 'win/vigem/client/x64/ViGEmClient.dll')) {
+            $path = Join-Path $pkg $need
+            if (-not (Test-Path $path)) { throw "vgamepad is incomplete: $need is missing" }
+            Write-Host "ok  $need"
+          }
+          "VGAMEPAD_PKG=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build
         shell: pwsh
@@ -49,8 +59,8 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name "NCM Wheel Support" `
             --collect-all sdl2dll `
-            --collect-all vgamepad `
             --add-data "wheel-profiles;wheel-profiles" `
+            --add-data "$env:VGAMEPAD_PKG;vgamepad" `
             --hidden-import sdl2 `
             --hidden-import vgamepad `
             --hidden-import tkinter `

@@ -61,6 +61,8 @@ Invoke-Native -Exe $python -Arguments @('-m','pip','install','--quiet','--upgrad
 # --windowed: no console. The companion is meant to be invisible; its readouts belong in the NCM panel.
 # --collect-all sdl2dll: pysdl2-dll ships SDL2.dll as package data, which PyInstaller will not find alone,
 # and without it the packaged build silently loses hardware discovery.
+$vgamepad = & $python -c "import site, os; print(os.path.join([p for p in site.getsitepackages() "
+                          + "if p.endswith('site-packages')][-1], 'vgamepad'))"
 $args = @(
     '-m', 'PyInstaller', '--noconfirm', '--clean', '--onefile', '--windowed',
     '--name', $name,
@@ -68,7 +70,9 @@ $args = @(
     '--workpath', (Join-Path $env:TEMP 'ncm-ffb-build'),
     '--specpath', (Join-Path $env:TEMP 'ncm-ffb-build'),
     '--collect-all', 'sdl2dll',
-    '--collect-all', 'vgamepad',
+    # NOT --collect-all: that IMPORTS the package to enumerate submodules, and vgamepad connects to
+    # the ViGEmBus driver at import time. Bundling the directory as data avoids executing it.
+    '--add-data', ($vgamepad + ';vgamepad'),
     '--add-data', ((Join-Path $root 'wheel-profiles') + ';wheel-profiles'),
     '--hidden-import', 'sdl2',
     $source
