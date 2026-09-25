@@ -83,9 +83,11 @@ jobs:
             dist/NCM Wheel Support.exe
             dist/SHA256SUMS.txt
           body: |
-            **Alpha.** Tested on one wheelbase (Logitech G29, gear drive). Belt drive and direct drive are
-            capped conservatively because nobody has tested them — see the README's safety section, and
-            please report back if you have either.
+            **Alpha.** Force levels were measured on a Logitech G29 (gear drive) by walking the full
+            ladder — that measurement moved the original reasoned numbers by about 2.5x. The belt and
+            direct-drive ceilings are scaled down from that baseline rather than measured on those
+            wheelbases, so they deliberately start low. If you have either, the README's safety section
+            explains what is useful to report.
 
             Built by GitHub Actions from the tagged source. Verify with `SHA256SUMS.txt`:
 

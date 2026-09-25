@@ -6,9 +6,9 @@ Force feedback is driven by **real vehicle telemetry** — throttle, brake, stee
 travel and measured tyre slip, read from the game's own vehicle state. Not from an FFT of your game audio,
 which is how this sort of thing usually has to be done in a game with no native wheel support.
 
-> **Status: alpha.** Tested on one wheelbase (Logitech G29, gear drive). Belt drive and direct drive are
-> untested by the author and are capped conservatively until someone tests them. See
-> [Helping test](#helping-test).
+> **Status: alpha.** Force levels were measured on a Logitech G29 (gear drive). The belt and direct-drive
+> ceilings are scaled down from that baseline rather than measured on those wheelbases, so they start low on
+> purpose. See [Helping test](#helping-test).
 
 ---
 
@@ -76,9 +76,10 @@ So:
 | **Rate of change is capped too** | a spike is what hurts, not a sustained level |
 | **Output is off until you arm it** | and stops on every exit path — idle, disconnect, crash |
 
-Those ceilings are **measured, not guessed**. The first set were reasoned from first principles and were
-about 2.5× too high; a real wheel and a person corrected them. That is why untested classes are held low
-rather than estimated.
+The gear-drive numbers are **measured, not guessed**. The first set were reasoned from first principles
+and were about 2.5× too high; walking the ladder on a real wheel corrected them. The other classes are scaled
+from that measurement, which is why they start below where the measured class ended up — an extrapolation
+should be more cautious than the thing it is extrapolated from.
 
 **Method:** start at the lowest rung. Step up only while each step still adds something. **Stop as soon as
 one does not.**
@@ -107,8 +108,9 @@ rather than a fact, so it is printed at startup — if yours come out swapped, a
 
 ## Helping test
 
-**Belt drive and direct drive owners especially.** The author has a G29 only, so those classes are capped low
-on purpose and nobody has confirmed whether the numbers are useful or pointless.
+**Belt drive and direct drive owners especially.** Those ceilings are extrapolated from the G29
+measurement, not taken on that hardware, so the open question is narrow and specific: **is the capped range
+useful on your wheel, or is the whole ladder too faint to be worth anything?** Either answer is worth having.
 
 What is useful to report:
 
