@@ -62,8 +62,11 @@ STATE = {
 }
 
 
+LOG_FILE = {"path": None}
+
+
 class _Tee(object):
-    """Write to the real stdout when there is one, and always into LOG."""
+    """Write to the real stdout when there is one, always into LOG, and to a file when asked."""
 
     def __init__(self, stream):
         self.stream = stream
@@ -72,6 +75,12 @@ class _Tee(object):
         for line in str(text).splitlines():
             if line.strip():
                 LOG.append(line)
+                if LOG_FILE["path"]:
+                    try:
+                        with io.open(LOG_FILE["path"], "a", encoding="utf-8") as fh:
+                            fh.write(line + chr(10))
+                    except Exception:                           # noqa: BLE001 - logging must never break us
+                        LOG_FILE["path"] = None
         if self.stream is not None:
             try:
                 self.stream.write(text)
@@ -328,7 +337,57 @@ def _read_frame(conn: socket.socket):
 # wins, so a driver can hold a controller in their hands and keep the wheel in front of them. On foot the rig
 # is suppressed entirely -- a wheel should not be nudging the walk axis while you are walking.
 
-PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wheel-profiles")
+def config_path():
+    """Where a user's own device choices live -- beside their data, not beside the program, because the
+    program may be a read-only exe sitting in Downloads."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "NCM Wheel Support")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception:                                           # noqa: BLE001
+        folder = os.path.expanduser("~")
+    return os.path.join(folder, "devices.json")
+
+
+def load_overrides():
+    try:
+        # `utf-8-sig` because a file written by Notepad or PowerShell's Out-File carries a BOM, and
+        # `json.load` refuses it. Silently ignoring somebody's hand-edited config is a bad failure.
+        with io.open(config_path(), encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        if data:
+            print("[in ] using your saved device choices (%s)" % config_path(), flush=True)
+        return data or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:                                    # noqa: BLE001
+        # Say so. A config that cannot be parsed is not the same as no config, and the difference is the
+        # whole reason someone would be confused about why their choices were ignored.
+        print("[in ] your saved device choices could not be read (%s); using detection" % exc, flush=True)
+        return {}
+
+
+def save_overrides(data):
+    try:
+        with io.open(config_path(), "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        print("[in ] device choices saved", flush=True)
+        return True
+    except Exception as exc:                                    # noqa: BLE001
+        print("[in ] could not save device choices: %s" % exc, flush=True)
+        return False
+
+
+def _bundle_dir():
+    """Where our own data files live.
+
+    PyInstaller unpacks a onefile build into a temporary folder and points `sys._MEIPASS` at it. Using
+    `__file__` there resolves inside that folder too -- but only for files that were actually bundled, which
+    is the trap this fell into: the path looked right and the file was not there."""
+    return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+
+
+PROFILE_DIR = os.path.join(_bundle_dir(), "wheel-profiles")
 
 # A button box or rim reports no useful name on some hardware (the owner's reads as "axis 28 button device"),
 # so it is recognised by shape as well: many buttons and no axes that behave like controls.
@@ -373,6 +432,10 @@ class Device:
         self.role, self.profile = role, profile or {}
         self.rest = {}
         self.polled = False
+        self.axis_count = 0
+        self.button_count = 0
+        self.centred_axes = []
+        self.rest_axes = []
 
 
 class Input:
@@ -399,6 +462,8 @@ class Input:
         self.steering = self.pedals = self.rim = None
         self.steer_axis = 0
         self.pedal_axes = {}
+        self.candidates = []
+        self.overrides = load_overrides()
         self.detected_class = "unknown"
         self.running = False
         self.thread = None
@@ -456,11 +521,16 @@ class Input:
             # Name the cause and the fix. "input unavailable" on its own sends someone hunting through a
             # stack trace for a driver they have never heard of.
             detail = str(exc)
-            if "vgamepad" in detail or "ViGEm" in detail or "client" in detail.lower():
+            # **Ask before blaming.** This previously reported "ViGEmBus is not installed" whenever the
+            # library failed for any reason -- including on a machine where the driver was installed and
+            # running, where the real fault was a packaging bug of ours. A confidently wrong diagnostic
+            # sends someone to fix something that was never broken.
+            if not vigem_present():
                 return ("ViGEmBus is not installed, so the wheel and pedals cannot drive the car. "
                         "Close and reopen this program and it will offer to install it for you. "
                         "(Force feedback does not need it and works either way.)")
-            return "input unavailable: %s" % detail
+            return ("The virtual controller could not start even though ViGEmBus is installed. "
+                    "This is a fault on our side, not yours -- please send the diagnostics. (%s)" % detail)
         self.sdl, self.vg = sdl2, vg
         try:
             sdl2.SDL_Init(sdl2.SDL_INIT_JOYSTICK | sdl2.SDL_INIT_GAMECONTROLLER)
@@ -495,8 +565,41 @@ class Input:
                 dev = Device(i, nm, handle, "", profile)
                 dev.rest = {a: values[a] for a in range(n_axes)}
                 dev.polled = polled
+                dev.axis_count, dev.button_count = n_axes, n_buttons
+                dev.centred_axes, dev.rest_axes = list(centred), list(pedal_axes)
+                # **Every device is a candidate for every role**, whatever detection decides next. The
+                # window needs the whole list to offer a choice, not only the ones that got picked.
+                self.candidates.append(dev)
                 tag = (profile or {}).get("name")
                 roles = []
+
+                forced = self.overrides.get("roles") or {}
+                if forced:
+                    # A user's choice outranks detection completely -- including a choice of "none".
+                    steer = forced.get("steering") or {}
+                    if steer.get("name") == nm and self.steering is None:
+                        self.steering = dev
+                        self.steer_axis = int(steer.get("axis", centred[0] if centred else 0))
+                        self.detected_class = steer.get("class") or (profile or {}).get(
+                            "device_class", "unknown")
+                        roles.append("steering ax%d (your choice)" % self.steer_axis)
+                    ped = forced.get("pedals") or {}
+                    if ped.get("name") == nm and self.pedals is None:
+                        self.pedals = dev
+                        for which in ("throttle", "brake", "clutch"):
+                            if ped.get(which) is not None and int(ped[which]) >= 0:
+                                self.pedal_axes[which] = int(ped[which])
+                        roles.append("pedals (your choice) " + ", ".join(
+                            "%s=ax%s" % (k, v) for k, v in sorted(self.pedal_axes.items())))
+                    rim = forced.get("rim") or {}
+                    if rim.get("name") == nm and self.rim is None:
+                        self.rim = dev
+                        roles.append("%d buttons (your choice)" % n_buttons)
+                    # Anything the user did not name stays unassigned rather than being guessed into a role
+                    # they deliberately left empty.
+                    print("[in ] device  : %d %s -- %s"
+                          % (i, nm, "; ".join(roles) if roles else "available, not assigned"), flush=True)
+                    continue
 
                 # **One device can hold two roles.** A Thrustmaster presents wheel and pedals together.
                 if self.steering is None and centred and n_buttons < 26:
@@ -709,6 +812,19 @@ class Input:
             "steerAxis": self.steer_axis,
         }
 
+    def layout(self):
+        """Everything the window needs to draw its dropdowns: what exists, and what is currently assigned."""
+        return {
+            "devices": [{"name": d.name, "axes": d.axis_count, "buttons": d.button_count,
+                         "centred": d.centred_axes, "atRest": d.rest_axes} for d in self.candidates],
+            "steering": self.steering.name if self.steering else None,
+            "steerAxis": self.steer_axis,
+            "pedals": self.pedals.name if self.pedals else None,
+            "pedalAxes": dict(self.pedal_axes),
+            "rim": self.rim.name if self.rim else None,
+            "deviceClass": self.detected_class,
+        }
+
     def stop(self):
         """Release everything. A virtual pad left holding a trigger is a car left accelerating."""
         self.running = False
@@ -718,6 +834,19 @@ class Input:
                 self.pad.update()
         except Exception:                                       # noqa: BLE001
             pass
+        # Release the devices too, so re-opening with different roles is possible without a restart.
+        for dev in self.candidates:
+            try:
+                self.sdl.SDL_JoystickClose(dev.handle)
+            except Exception:                                   # noqa: BLE001
+                pass
+        for _, ctrl in self.controllers:
+            try:
+                self.sdl.SDL_GameControllerClose(ctrl)
+            except Exception:                                   # noqa: BLE001
+                pass
+        self.candidates, self.controllers = [], []
+        self.steering = self.pedals = self.rim = None
 
 
 class Output:
@@ -1487,6 +1616,151 @@ class VigemDialog(object):
 # setting lives in the game, where the driver already is.
 
 
+class DevicesDialog(object):
+    """Reassign roles by hand.
+
+    **Detection is a proposal, not a diagnosis.** It reads a wheel by where its axes rest, which works well
+    until it meets a load cell that rests mid-travel, a handbrake that looks like a pedal, or a rim that
+    enumerates as something else. Rather than grow the heuristic forever, this lets the person who can see
+    the hardware say what it is -- and remembers it.
+    """
+
+    ROLES = ("steering", "pedals", "rim")
+
+    def __init__(self, tk, rig, on_apply):
+        self.tk, self.rig, self.on_apply = tk, rig, on_apply
+
+    def show(self):
+        tk = self.tk
+        layout = self.rig.layout()
+        devices = layout["devices"]
+        names = ["(none)"] + [d["name"] for d in devices]
+        by_name = {d["name"]: d for d in devices}
+
+        bg, fg, dim = "#0d1117", "#d8e0e8", "#8b98a5"
+        win = tk.Toplevel()
+        win.title("Devices")
+        win.configure(bg=bg)
+        win.geometry("640x460")
+        win.grab_set()
+
+        tk.Label(win, text="WHICH DEVICE IS WHICH", bg=bg, fg=fg,
+                 font=("Consolas", 12, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(win, text=("These are filled in by detection. Change anything it got wrong -- your choice "
+                            "is saved and used from now on."),
+                 bg=bg, fg=dim, font=("Consolas", 9), justify="left",
+                 wraplength=600, anchor="w").pack(anchor="w", padx=16, pady=(0, 10))
+
+        grid = tk.Frame(win, bg=bg)
+        grid.pack(fill="x", padx=16)
+        self.vars = {}
+        row = 0
+
+        def label(text, hint=None):
+            nonlocal row
+            tk.Label(grid, text=text, bg=bg, fg=dim, font=("Consolas", 9),
+                     anchor="w", width=16).grid(row=row, column=0, sticky="w", pady=3)
+            if hint:
+                tk.Label(grid, text=hint, bg=bg, fg="#5a6672", font=("Consolas", 8),
+                         anchor="w").grid(row=row, column=2, sticky="w", padx=(10, 0))
+
+        def device_menu(role, current):
+            var = tk.StringVar(value=current or "(none)")
+            tk.OptionMenu(grid, var, *names).grid(row=row, column=1, sticky="we", pady=3)
+            self.vars[role] = var
+            return var
+
+        def axis_menu(key, current, count):
+            var = tk.StringVar(value=str(current) if current is not None else "-")
+            choices = ["-"] + [str(i) for i in range(max(count, 8))]
+            tk.OptionMenu(grid, var, *choices).grid(row=row, column=1, sticky="we", pady=3)
+            self.vars[key] = var
+            return var
+
+        steer_axes = by_name.get(layout["steering"], {}).get("axes", 8)
+        pedal_axes_count = by_name.get(layout["pedals"], {}).get("axes", 8)
+
+        label("STEERING", "the wheel itself")
+        device_menu("steering", layout["steering"]); row += 1
+        label("  steering axis", "rests at centre")
+        axis_menu("steer_axis", layout["steerAxis"], steer_axes); row += 1
+
+        label("PEDALS", "may be the same device")
+        device_menu("pedals", layout["pedals"]); row += 1
+        for which, hint in (("throttle", "rests at one end"), ("brake", ""), ("clutch", "optional")):
+            label("  " + which, hint)
+            axis_menu(which, layout["pedalAxes"].get(which), pedal_axes_count); row += 1
+
+        label("BUTTONS", "rim or button box")
+        device_menu("rim", layout["rim"]); row += 1
+
+        label("WHEEL TYPE", "sets the force ceiling")
+        cls = tk.StringVar(value=layout.get("deviceClass") or "unknown")
+        tk.OptionMenu(grid, cls, "gear", "belt", "direct_drive", "unknown").grid(
+            row=row, column=1, sticky="we", pady=3)
+        self.vars["class"] = cls
+        row += 1
+        grid.columnconfigure(1, weight=1)
+
+        # What each device looks like, so somebody can tell two identical names apart or spot the one whose
+        # axes are all resting at an end.
+        detail = "\n".join(
+            "%-44s %d axes, %d buttons%s" % (
+                d["name"][:44], d["axes"], d["buttons"],
+                ("  centred: %s" % d["centred"]) if d["centred"] else "")
+            for d in devices) or "no joystick devices found"
+        box = tk.Label(win, text=detail, bg="#11161d", fg=dim, font=("Consolas", 8),
+                       justify="left", anchor="w")
+        box.pack(fill="x", padx=16, pady=12)
+
+        note = tk.Label(win, text="", bg=bg, fg="#f0a04b", font=("Consolas", 9), anchor="w")
+        note.pack(fill="x", padx=16)
+
+        bar = tk.Frame(win, bg=bg)
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+
+        def apply():
+            roles = {}
+            steer_name = self.vars["steering"].get()
+            if steer_name != "(none)":
+                roles["steering"] = {"name": steer_name,
+                                     "axis": int(self.vars["steer_axis"].get() or 0),
+                                     "class": self.vars["class"].get()}
+            ped_name = self.vars["pedals"].get()
+            if ped_name != "(none)":
+                entry = {"name": ped_name}
+                for which in ("throttle", "brake", "clutch"):
+                    v = self.vars[which].get()
+                    entry[which] = int(v) if v not in ("-", "") else -1
+                roles["pedals"] = entry
+            rim_name = self.vars["rim"].get()
+            if rim_name != "(none)":
+                roles["rim"] = {"name": rim_name}
+            if save_overrides({"roles": roles}):
+                note.configure(text="Saved. Re-reading your devices...")
+                win.update_idletasks()
+                ok, why = self.on_apply()
+                note.configure(text="Devices reloaded." if ok else ("Could not reload: %s" % why))
+                win.after(900, win.destroy)
+            else:
+                note.configure(text="Could not save your choices.")
+
+        def reset():
+            if save_overrides({}):
+                note.configure(text="Cleared. Back to automatic detection...")
+                win.update_idletasks()
+                self.on_apply()
+                win.after(900, win.destroy)
+
+        tk.Button(bar, text="Apply and reload", command=apply, relief="flat", bg="#1f6feb",
+                  fg="#ffffff", font=("Consolas", 9), padx=12, pady=6).pack(side="left")
+        tk.Button(bar, text="Use automatic detection", command=reset, relief="flat", bg="#1c2530",
+                  fg=fg, font=("Consolas", 9), padx=12, pady=6).pack(side="left", padx=8)
+        tk.Button(bar, text="Close", command=win.destroy, relief="flat", bg="#1c2530",
+                  fg=fg, font=("Consolas", 9), padx=12, pady=6).pack(side="right")
+        win.wait_window()
+
+
 class StatusWindow(object):
     """A small always-honest readout: what was found, what is wrong, and a button that copies it all."""
 
@@ -1500,10 +1774,11 @@ class StatusWindow(object):
         ("Controller", "gamepads"),
     )
 
-    def __init__(self, on_close):
+    def __init__(self, on_close, rig=None, on_reload=None):
         import tkinter as tk
         from tkinter import scrolledtext
         self.tk, self.on_close = tk, on_close
+        self.rig, self.on_reload = rig, on_reload
         self.root = tk.Tk()
         self.root.title("NCM Wheel Support")
         self.root.geometry("560x470")
@@ -1545,6 +1820,9 @@ class StatusWindow(object):
         tk.Button(bar, text="Copy diagnostics", command=self.copy,
                   bg="#1c2530", fg=fg, relief="flat", font=("Consolas", 9),
                   padx=10, pady=4).pack(side="left")
+        tk.Button(bar, text="Devices...", command=self._devices,
+                  bg="#1c2530", fg=fg, relief="flat", font=("Consolas", 9),
+                  padx=10, pady=4).pack(side="left", padx=6)
         self.copied = tk.Label(bar, text="", bg=bg, fg="#5dd39e", font=("Consolas", 9))
         self.copied.pack(side="left", padx=10)
         tk.Label(bar, text="Settings live in the game: F6 -> WHEEL/PEDALS", bg=bg, fg=dim,
@@ -1576,6 +1854,12 @@ class StatusWindow(object):
             self.root.after(4000, lambda: self.copied.configure(text=""))
         except Exception:                                       # noqa: BLE001
             self.copied.configure(text="could not reach the clipboard")
+
+    def _devices(self):
+        if self.rig is None:
+            self.copied.configure(text="no input system to configure")
+            return
+        DevicesDialog(self.tk, self.rig, self.on_reload).show()
 
     def _value(self, key):
         if key == "listening":
@@ -1633,6 +1917,8 @@ def main() -> int:
                     help="wheel degrees per side mapped to full stick deflection (default 45).")
     ap.add_argument("--wheel-range", type=float, default=900.0,
                     help="the wheel's physical lock-to-lock range in degrees (default 900).")
+    ap.add_argument("--log", default=None,
+                    help="also append everything to this file. A packaged build has no console.")
     ap.add_argument("--headless", action="store_true",
                     help="no window. The old behaviour; CI and anyone who wants it invisible.")
     ap.add_argument("--selftest", action="store_true",
@@ -1646,6 +1932,9 @@ def main() -> int:
     ap.add_argument("--arm", action="store_true",
                     help="permit force output. OFF by default: everything works identically without it.")
     args = ap.parse_args()
+    if args.log:
+        LOG_FILE["path"] = args.log
+        print("[ui ] logging to %s" % args.log, flush=True)
 
     name, detected, caps = discover()
     device_class = args.device_class or detected
@@ -1822,9 +2111,34 @@ def main() -> int:
 
     # The window owns the main thread; the server runs behind it. Closing the window shuts everything down
     # through the same path as Ctrl-C, so there is one teardown rather than two.
+    def reload_input():
+        """Re-read the rig after the user changed which device is which.
+
+        Stop before re-opening: the devices are held by the running instance, and a second claim on the same
+        wheel is exactly the failure that looks like 'detection is broken'."""
+        if rig is None:
+            return False, "input is not running"
+        try:
+            rig.stop()
+            time.sleep(0.4)
+            rig.overrides = load_overrides()
+            why = rig.open()
+            if why:
+                problem(why)
+                return False, why
+            rig.start()
+            STATE["wheel"] = rig.steering.name if rig.steering else None
+            STATE["pedals"] = rig.pedals.name if rig.pedals else None
+            STATE["rim"] = rig.rim.name if rig.rim else None
+            STATE["gamepads"] = [n for n, _ in rig.controllers]
+            STATE["problems"] = []
+            return True, ""
+        except Exception as exc:                                # noqa: BLE001
+            return False, str(exc)
+
     threading.Thread(target=accept_loop, daemon=True).start()
     try:
-        window = StatusWindow(shutdown)
+        window = StatusWindow(shutdown, rig=rig, on_reload=reload_input)
     except Exception as exc:                                    # noqa: BLE001 - no display, no Tk, no matter
         print("[ui ] no window (%s); running headless" % exc, flush=True)
         try:

@@ -45,6 +45,8 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --windowed `
             --name "NCM Wheel Support" `
             --collect-all sdl2dll `
+            --collect-all vgamepad `
+            --add-data 'wheel-profiles;wheel-profiles' `
             --hidden-import sdl2 `
             --hidden-import vgamepad `
             --hidden-import tkinter `

@@ -68,6 +68,8 @@ $args = @(
     '--workpath', (Join-Path $env:TEMP 'ncm-ffb-build'),
     '--specpath', (Join-Path $env:TEMP 'ncm-ffb-build'),
     '--collect-all', 'sdl2dll',
+    '--collect-all', 'vgamepad',
+    '--add-data', ((Join-Path $root 'wheel-profiles') + ';wheel-profiles'),
     '--hidden-import', 'sdl2',
     $source
 )
